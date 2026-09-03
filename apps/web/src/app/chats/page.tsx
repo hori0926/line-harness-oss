@@ -9,6 +9,11 @@ import CcPromptButton from '@/components/cc-prompt-button'
 import FlexPreviewComponent from '@/components/flex-preview'
 import FriendInfoSidebar from '@/components/chats/friend-info-sidebar'
 import ImageUploader, { type ImageUploaderValue } from '@/components/shared/image-uploader'
+import {
+  canQuoteMessage,
+  quotedMessageIdForSend,
+  resolveQuoteExcerpt,
+} from './quote-reply'
 import { Button } from '@cloudflare/kumo/components/button'
 import { Checkbox } from '@cloudflare/kumo/components/checkbox'
 import { Input } from '@cloudflare/kumo/components/input'
@@ -37,6 +42,10 @@ interface ChatMessage {
   messageType: string
   content: string
   createdAt: string
+  /** true なら「このメッセージを引用して返信できる」(incoming / outgoing どちらもあり得る) */
+  quotable?: boolean
+  /** このメッセージが引用した元メッセージの id (同じ messages 配列内に居る想定) */
+  quotedMessageId?: string | null
 }
 
 // リッチメニューのタブ切替 (richmenuswitch) は、webhook が postback data
@@ -345,6 +354,9 @@ export default function ChatsPage() {
   const [error, setError] = useState('')
   const [messageContent, setMessageContent] = useState('')
   const [pendingImage, setPendingImage] = useState<ImageUploaderValue | null>(null)
+  // 引用リプライ: 引用する元メッセージの id。null = 引用なし。
+  // 画像とは排他 (サーバーが text 以外の引用を 400 で弾く)。
+  const [quotedMessageId, setQuotedMessageId] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
   const sendLockRef = useRef(false)
   const [notes, setNotes] = useState('')
@@ -530,6 +542,13 @@ export default function ChatsPage() {
     }
   }, [selectedChatId, loadChatDetail])
 
+  // 引用元は開いている会話のメッセージなので、会話が変わったら必ず捨てる。
+  // handleSelectChat 以外にも「次の未対応 →」やディープリンクなど
+  // setSelectedChatId を直接呼ぶ経路があるため、選択 id を単一の起点にする。
+  useEffect(() => {
+    setQuotedMessageId(null)
+  }, [selectedChatId])
+
   // Surface deep-linked chats in the sidebar even when the current account
   // filter or status filter would exclude them — otherwise the user replies
   // and the conversation stays invisible until they refresh.
@@ -593,6 +612,17 @@ export default function ChatsPage() {
     }
   }, [chatDetail?.id, chatDetail?.messages?.length])
 
+  // 引用プレビューの出し入れでコンポーザーの高さが変わり、メッセージ一覧が縮む/伸びる。
+  // 最下部付近を見ていたときだけ追従させる — 過去を遡って引用したときに
+  // 最下部へ吹き飛ばされると引用元を見失うので、上にいる場合は動かさない。
+  useEffect(() => {
+    const el = messagesScrollRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    // しきい値はプレビュー行の高さ (約 50px) 分の縮みを吸収できる程度に取る
+    if (distanceFromBottom <= 120) el.scrollTop = el.scrollHeight
+  }, [quotedMessageId])
+
   // Auto-resize textarea as messageContent grows
   useEffect(() => {
     const el = textareaRef.current
@@ -615,6 +645,8 @@ export default function ChatsPage() {
     setSelectedChatId(chatId)
     setMessageContent('')
     setPendingImage(null)
+    // 引用元は今の会話のメッセージなので、会話を切り替えたら必ず捨てる
+    setQuotedMessageId(null)
     setShowImagePicker(false)
     setShowComposerSettings(false)
     setShowMobileMemo(false)
@@ -664,6 +696,20 @@ export default function ChatsPage() {
       console.warn('[chats] loading indicator request failed:', err)
     }
   }, [showLoadingIndicator, loadingSeconds])
+
+  // 引用開始。画像とは排他 (サーバーが text 以外の引用を 400 で弾く) なので、
+  // 画像添付中は開始させず、空の画像ピッカーが開いていれば閉じて
+  // 「引用中に画像を足せてしまう」状態を作らせない。
+  const handleStartQuote = (messageId: string) => {
+    if (pendingImage) return
+    setQuotedMessageId(messageId)
+    setShowImagePicker(false)
+    // モバイルはソフトキーボードが勝手に開いてしまうのでデスクトップ (lg+) のみフォーカス
+    // — チャットを開いたときの自動フォーカスと同じ方針。
+    if (typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches) {
+      textareaRef.current?.focus()
+    }
+  }
 
   const handleSendMessage = async () => {
     if (!selectedChatId || sending || sendLockRef.current) return
@@ -729,8 +775,16 @@ export default function ChatsPage() {
       // --- Text send path (runs independently — both paths execute when both image and text are present) ---
       if (messageContent.trim()) {
         const content = messageContent.trim()
-        await api.chats.send(sendingChatId, { content })
+        // 引用は text のときだけ。画像を添付していたら付けない (サーバーが 400 を返す)。
+        // 送信に失敗した場合は catch に抜けてここまで来ないので、引用状態は保持される
+        // (やり直せる)。
+        const quotedId = quotedMessageIdForSend(quotedMessageId, Boolean(pendingImage))
+        await api.chats.send(sendingChatId, {
+          content,
+          ...(quotedId ? { quotedMessageId: quotedId } : {}),
+        })
         setMessageContent('')
+        setQuotedMessageId(null)
         // Optimistic update: append message locally instead of refetching (prevents scroll jump / full reload feel)
         // Only mutate chatDetail if it still corresponds to the chat we just sent to
         setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
@@ -745,6 +799,11 @@ export default function ChatsPage() {
               messageType: 'text',
               content,
               createdAt: now,
+              // 送信直後はまだ引用トークンを取得していない (LINE の push レスポンス
+              // 由来なのでサーバー側にしか無い)。次回の再取得で quotable: true に
+              // なり引用できるようになる。
+              quotable: false,
+              quotedMessageId: quotedId ?? null,
             },
           ],
         } : prev)
@@ -1135,6 +1194,61 @@ export default function ChatsPage() {
                       bubbleContent = <span>{msg.content}</span>
                     }
 
+                    // --- 引用リプライ ---
+                    // 引用元の抜粋。配列に居ない (履歴 1000 件の打ち切り) 場合は
+                    // resolveQuoteExcerpt がフォールバック文言を返すので落ちない。
+                    const quotedExcerpt = msg.quotedMessageId
+                      ? resolveQuoteExcerpt(allMsgs, msg.quotedMessageId)
+                      : null
+                    const quotedBlock = quotedExcerpt ? (
+                      <div
+                        className={`mb-1.5 border-l-2 pl-2 text-xs leading-snug break-words ${
+                          isBareContent
+                            ? 'border-gray-300 text-gray-500'
+                            : isOutgoing
+                              ? 'border-white/60 text-white/80'
+                              : 'border-gray-300 text-gray-500'
+                        }`}
+                      >
+                        {quotedExcerpt}
+                      </div>
+                    ) : null
+
+                    // 引用ボタン。quotable なメッセージにだけ出す (incoming / outgoing 両方)。
+                    // デスクトップ (lg+) はホバー/フォーカスで出現、それ未満 (タッチ) は
+                    // 常時表示 — ホバーだけに依存すると触れない端末が出るため。
+                    // 位置はバブルの内側 (画面中央側)、背景はどちらの向きでもチャット背景
+                    // (青) の上なので白チップで統一できる。
+                    const isQuoting = quotedMessageId === msg.id
+                    const quoteBlockedByImage = Boolean(pendingImage)
+                    const quoteButton = canQuoteMessage(msg) ? (
+                      <Button
+                        type="button"
+                        size="xs"
+                        // primary (= LINE グリーン) は outgoing バブルの色と同じで、
+                        // 隣に並ぶと 1 つの緑の塊に見える。引用中は白地 + 緑文字/枠にして
+                        // どちらの向きのバブルの横でも「押されている」ことが分かるようにする。
+                        variant="ghost"
+                        onClick={() => handleStartQuote(msg.id)}
+                        disabled={quoteBlockedByImage}
+                        title={
+                          quoteBlockedByImage
+                            ? '画像を添付中は引用できません (画像を外すと引用できます)'
+                            : 'このメッセージを引用して返信'
+                        }
+                        aria-label="このメッセージを引用して返信"
+                        aria-pressed={isQuoting}
+                        className={`flex-shrink-0 ${
+                          isQuoting
+                            // 引用中はボタン自体が状態表示なので常に出しっぱなしにする
+                            ? 'bg-white text-green-700 ring-1 ring-green-500'
+                            : 'bg-white/85 text-gray-600 hover:bg-white lg:opacity-0 lg:group-hover:opacity-100 lg:group-focus-within:opacity-100'
+                        }`}
+                      >
+                        {isQuoting ? '引用中' : '引用'}
+                      </Button>
+                    ) : null
+
                     return (
                       <div key={msg.id}>
                         {showDateSep && (
@@ -1145,7 +1259,7 @@ export default function ChatsPage() {
                           </div>
                         )}
                         <div
-                          className={`flex items-end gap-2 ${isOutgoing ? 'justify-end' : 'justify-start'}`}
+                          className={`group flex items-end gap-2 ${isOutgoing ? 'justify-end' : 'justify-start'}`}
                         >
                           {/* 相手のアイコン（incoming のみ） */}
                           {!isOutgoing && (
@@ -1160,22 +1274,38 @@ export default function ChatsPage() {
                               親の幅が確定していないとパーセントを解決できず
                               min-content（1 文字幅）まで潰れて縦一列に改行される */}
                           <div className={`flex flex-col w-full min-w-0 ${isOutgoing ? 'items-end' : 'items-start'}`}>
-                            {/* メッセージバブル。flex / sticker はバブル chrome なしで直接置く */}
-                            {isBareContent ? (
-                              <div className="max-w-[92%] lg:max-w-[80%] min-w-0">
-                                {bubbleContent}
-                              </div>
-                            ) : (
-                              <div
-                                className={`max-w-[75%] lg:max-w-[60%] px-3 py-2 text-sm break-words whitespace-pre-wrap ${
-                                  isOutgoing
-                                    ? 'rounded-tl-2xl rounded-tr-md rounded-bl-2xl rounded-br-2xl bg-kumo-brand text-kumo-inverse'
-                                    : 'rounded-tl-md rounded-tr-2xl rounded-bl-2xl rounded-br-2xl bg-white text-gray-900'
-                                }`}
-                              >
-                                {bubbleContent}
-                              </div>
-                            )}
+                            {/* メッセージバブル + 引用ボタン。
+                                バブルの max-w は % 指定なので、この行は w-full を保つこと
+                                (幅が確定しないとバブルが min-content まで潰れる)。
+                                引用ボタンはバブルの内側 (画面中央側)・下端揃え。
+                                items-end なのは、outgoing の長文バブルでも引用ボタンが
+                                時刻表示の近くに留まり、宙に浮かないようにするため。 */}
+                            <div
+                              className={`flex w-full min-w-0 items-end gap-1 ${
+                                isOutgoing ? 'justify-end' : 'justify-start'
+                              }`}
+                            >
+                              {isOutgoing && quoteButton}
+                              {/* flex / sticker はバブル chrome なしで直接置く */}
+                              {isBareContent ? (
+                                <div className="max-w-[92%] lg:max-w-[80%] min-w-0">
+                                  {quotedBlock}
+                                  {bubbleContent}
+                                </div>
+                              ) : (
+                                <div
+                                  className={`max-w-[75%] lg:max-w-[60%] px-3 py-2 text-sm break-words whitespace-pre-wrap ${
+                                    isOutgoing
+                                      ? 'rounded-tl-2xl rounded-tr-md rounded-bl-2xl rounded-br-2xl bg-kumo-brand text-kumo-inverse'
+                                      : 'rounded-tl-md rounded-tr-2xl rounded-bl-2xl rounded-br-2xl bg-white text-gray-900'
+                                  }`}
+                                >
+                                  {quotedBlock}
+                                  {bubbleContent}
+                                </div>
+                              )}
+                              {!isOutgoing && quoteButton}
+                            </div>
                             {/* 時刻 */}
                             <span className="text-xs text-white/50 mt-0.5 px-1">
                               {new Date(msg.createdAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
@@ -1273,6 +1403,32 @@ export default function ChatsPage() {
                     textareaRef.current?.focus()
                   }}
                 >
+                  {/* 引用中プレビュー。入力欄の上に出して × で解除できる。
+                      textarea の自動リサイズは textarea 自身の scrollHeight でしか
+                      計算していないので、この行を足しても高さ計算には影響しない。 */}
+                  {quotedMessageId && (
+                    <div className="flex items-start gap-2 border-b border-gray-200 px-3 pt-2 pb-2">
+                      <div className="min-w-0 flex-1 border-l-2 border-green-500 pl-2">
+                        <p className="text-[11px] text-gray-400">引用中</p>
+                        <p className="truncate text-xs text-gray-600">
+                          {resolveQuoteExcerpt(chatDetail.messages, quotedMessageId)}
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        size="xs"
+                        shape="square"
+                        variant="ghost"
+                        onClick={() => setQuotedMessageId(null)}
+                        title="引用を解除"
+                        aria-label="引用を解除"
+                      >
+                        <svg className="w-4 h-4 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </Button>
+                    </div>
+                  )}
                   <textarea
                     ref={textareaRef}
                     rows={2}
@@ -1305,7 +1461,10 @@ export default function ChatsPage() {
                       shape="square"
                       variant={showImagePicker || pendingImage ? 'primary' : 'ghost'}
                       onClick={() => setShowImagePicker((v) => !v)}
-                      title="画像を添付"
+                      // 引用と画像は排他 (サーバーが text 以外の引用を 400 で弾く)。
+                      // 引用を勝手に捨てるのではなく、画像側を止めて理由を出す。
+                      disabled={Boolean(quotedMessageId)}
+                      title={quotedMessageId ? '引用中は画像を送信できません (引用を解除してください)' : '画像を添付'}
                       aria-label="画像を添付"
                     >
                       <svg className="w-5 h-5 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">

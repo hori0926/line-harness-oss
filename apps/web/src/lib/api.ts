@@ -1005,7 +1005,19 @@ export const api = {
       )
     },
     get: (id: string) =>
-      fetchApi<ApiResponse<Chat & { messages?: { id: string; content: string; senderType: string; createdAt: string }[] }>>(
+      fetchApi<ApiResponse<Chat & {
+        messages?: {
+          id: string
+          content: string
+          senderType: string
+          createdAt: string
+          // 引用リプライ: quotable が true なら、このメッセージを引用して返信できる
+          // (incoming / outgoing どちらもあり得る)。トークンの実値はサーバーから出さない。
+          // quotedMessageId は、このメッセージが引用した元メッセージの id。
+          quotable?: boolean
+          quotedMessageId?: string | null
+        }[]
+      }>>(
         `/api/chats/${id}`,
       ),
     create: (data: { friendId: string; operatorId?: string | null }) =>
@@ -1018,7 +1030,8 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(data),
       }),
-    send: (id: string, data: { content: string; messageType?: string }) =>
+    // quotedMessageId は messageType: 'text' のときのみ指定可能 (画像に付けるとサーバーが 400)
+    send: (id: string, data: { content: string; messageType?: string; quotedMessageId?: string }) =>
       fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
         method: 'POST',
         body: JSON.stringify(data),
