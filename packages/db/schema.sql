@@ -192,6 +192,10 @@ CREATE TABLE IF NOT EXISTS messages_log (
   delivery_type    TEXT CHECK (delivery_type IN ('push', 'reply', 'test')),
   source           TEXT,
   line_account_id  TEXT,
+  -- 受信メッセージの LINE quoteToken (引用リプライ用。有効期限なし)。引用不可の種別は NULL
+  quote_token      TEXT,
+  -- 引用リプライで送信した際の引用元 messages_log.id。引用なしは NULL
+  quoted_message_id TEXT,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
