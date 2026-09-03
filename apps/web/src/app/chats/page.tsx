@@ -14,6 +14,15 @@ import {
   quotedMessageIdForSend,
   resolveQuoteExcerpt,
 } from './quote-reply'
+import {
+  DETAIL_POLL_INTERVAL_MS,
+  applyChatListRow,
+  countNewMessages,
+  mergeMessages,
+  shouldFollowScroll,
+  shouldPollChatDetail,
+  sinceForPoll,
+} from './message-sync'
 import { Button } from '@cloudflare/kumo/components/button'
 import { Checkbox } from '@cloudflare/kumo/components/checkbox'
 import { Input } from '@cloudflare/kumo/components/input'
@@ -46,6 +55,14 @@ interface ChatMessage {
   quotable?: boolean
   /** このメッセージが引用した元メッセージの id (同じ messages 配列内に居る想定) */
   quotedMessageId?: string | null
+  /** 手動送信した担当者の名前。自動配信 (シナリオ / 一斉配信) は null */
+  sentByStaffName?: string | null
+  /**
+   * 楽観更新でローカルに足しただけの行 (サーバー未確認)。
+   * ポーリングの since / マージで特別扱いするためのローカル専用フラグで、
+   * サーバーからは絶対に返ってこない。
+   */
+  pending?: boolean
 }
 
 // リッチメニューのタブ切替 (richmenuswitch) は、webhook が postback data
@@ -368,6 +385,29 @@ export default function ChatsPage() {
   const isComposingRef = useRef(false)
   const messagesScrollRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // --- 自動更新 (ポーリング) 用 ---
+  // 「今この瞬間の値」をポーリングのコールバックから読むための ref 群。
+  // state を直接 useCallback の依存に入れると、送信のたびにコールバックが
+  // 作り直されてインターバルがリセットされてしまう。
+  const sendingRef = useRef(false)
+  const chatDetailRef = useRef<ChatDetail | null>(null)
+  const detailPollInFlightRef = useRef(false)
+  /**
+   * メッセージ一覧が最下部付近にあるか。スクロールのたびに更新する。
+   * 「メッセージが増える前」の位置を保持しているのが要点 — 増えた後に
+   * 測ると追加分の高さでしきい値を超え、最下部にいたのに追従しなくなる。
+   */
+  const atBottomRef = useRef(true)
+  /** 次の再描画で無条件に最下部へ送る (自分が送信したときだけ立てる) */
+  const forceScrollToBottomRef = useRef(false)
+  /** 直近のスクロール処理を行ったチャット。切替の検出に使う */
+  const scrolledChatIdRef = useRef<string | null>(null)
+  /** 過去を遡って読んでいる最中に新着が来た */
+  const [hasUnseenMessages, setHasUnseenMessages] = useState(false)
+
+  useEffect(() => { sendingRef.current = sending }, [sending])
+  useEffect(() => { chatDetailRef.current = chatDetail }, [chatDetail])
   // OAM(公式LINEマネージャー)風レイアウト: 添付・設定・メモは折りたたみ、
   // メッセージ表示領域を最大化する
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -498,6 +538,7 @@ export default function ChatsPage() {
   }, [sendMode])
 
   const loadChatDetail = useCallback(async (chatId: string) => {
+    detailPollInFlightRef.current = true
     setDetailLoading(true)
     setError('')
     try {
@@ -515,7 +556,79 @@ export default function ChatsPage() {
       const msg = err instanceof Error ? err.message : String(err)
       setError(`チャット詳細の読み込みに失敗しました: ${msg}`)
     } finally {
+      detailPollInFlightRef.current = false
       setDetailLoading(false)
+    }
+  }, [])
+
+  /**
+   * 自動更新 (差分取得)。loadChatDetail とは別物なので混同しないこと:
+   * - detailLoading を触らない (15 秒ごとに「読み込み中...」へ差し替わってしまう)
+   * - notes state を触らない (メモを編集中に上書きすると入力が消える)
+   * - messageContent / quotedMessageId / pendingImage は一切触らない
+   * - エラーバナーも出さない (通信が一瞬切れるたびにレイアウトが動くため)
+   *
+   * since には「今持っているサーバー由来メッセージの最新 createdAt」を渡す。
+   * 全件取得は毎回 1000 行読むので、ポーリングでは必ず差分にする。
+   */
+  const pollChatDetail = useCallback(async (chatId: string) => {
+    if (!shouldPollChatDetail({
+      documentHidden: typeof document !== 'undefined' && document.visibilityState === 'hidden',
+      sending: sendingRef.current || sendLockRef.current,
+      hasSelectedChat: Boolean(chatId),
+      requestInFlight: detailPollInFlightRef.current,
+    })) return
+
+    const prevMessages = chatDetailRef.current?.id === chatId
+      ? (chatDetailRef.current?.messages ?? [])
+      : []
+    const since = sinceForPoll(prevMessages)
+
+    detailPollInFlightRef.current = true
+    try {
+      const res = await api.chats.get(chatId, since ? { since } : undefined)
+      if (!res.success) return
+      const { isDelta: deltaFlag, ...detailFields } = res.data as unknown as ChatDetail & { isDelta?: boolean }
+      // isDelta が付いていなければ全件として扱う (置き換え) — 差分でないものを
+      // 差分としてマージすると重複が残るより取りこぼしの方が怖いので安全側に倒す。
+      const isDelta = deltaFlag === true
+      const incoming = detailFields.messages ?? []
+
+      const merged = mergeMessages(prevMessages, incoming, { isDelta })
+      const added = countNewMessages(prevMessages, merged)
+
+      setChatDetail((prev) => {
+        // 取得中にチャットを切り替えられていたら捨てる
+        if (!prev || prev.id !== chatId) return prev
+        return {
+          ...prev,
+          // messages 以外 (status / friendName / lastMessageAt など) は
+          // since の有無に関わらず常に最新の完全な値が返る
+          ...detailFields,
+          messages: mergeMessages(prev.messages ?? [], incoming, { isDelta }),
+        }
+      })
+
+      if (added > 0) {
+        // 一覧はコストが高すぎて再取得できない (1 回 16 万行) ので、今開いている
+        // 会話の行だけを送信後の楽観更新と同じ形でローカル更新する。
+        // プレビューは lastMessage* が空で返ることがあるので messages の末尾で補う。
+        const newest = merged[merged.length - 1]
+        setChats((prev) => applyChatListRow(prev, chatId, {
+          lastMessageAt: detailFields.lastMessageAt ?? newest?.createdAt ?? null,
+          lastMessageContent: detailFields.lastMessageContent ?? newest?.content ?? null,
+          lastMessageDirection: detailFields.lastMessageDirection ?? newest?.direction ?? null,
+          lastMessageType: detailFields.lastMessageType ?? newest?.messageType ?? null,
+          // status が来ていないときに undefined で上書きすると一覧のバッジが消える
+          ...(detailFields.status ? { status: detailFields.status } : {}),
+        }))
+        // 過去を遡って読んでいる最中なら、スクロールを動かさずに導線だけ出す
+        if (!atBottomRef.current) setHasUnseenMessages(true)
+      }
+    } catch {
+      // ベストエフォート。次の 15 秒で取り直せば足りるので UI には出さない
+    } finally {
+      detailPollInFlightRef.current = false
     }
   }, [])
 
@@ -541,6 +654,40 @@ export default function ChatsPage() {
       setChatDetail(null)
     }
   }, [selectedChatId, loadChatDetail])
+
+  // --- 自動更新: 選択中チャットの差分取得 (15 秒間隔) ---
+  // 複数人で手動返信を回すと、相手の新着も同僚の返信も画面に出ないまま
+  // 二重返信が起きる。それを埋めるのがこのポーリング。
+  // タブが非表示の間は止め、戻ってきたら即座に 1 回取得する
+  // (放置後に開いて古い画面を見せない)。
+  useEffect(() => {
+    if (!selectedChatId) return
+    const chatId = selectedChatId
+    const tick = () => { void pollChatDetail(chatId) }
+    const timer = window.setInterval(tick, DETAIL_POLL_INTERVAL_MS)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') tick()
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [selectedChatId, pollChatDetail])
+
+  // チャット一覧には定期ポーリングを入れない。
+  // 一覧クエリは last_any CTE が messages_log を全走査する構造で、本番実測
+  // 459ms / 165k rows_read (LIMIT 300)。30 秒間隔だとオペレーター 5 人で
+  // 1 日 8 億行に達し、D1 の無料枠 (500 万行/日) を 2 桁超過する。
+  // 代わりに、選択中チャットの差分ポーリングで新着を検知したときに
+  // その 1 行だけをローカルで更新する (上の pollChatDetail 参照)。
+  // 他の会話の新着はサイドバーの未対応バッジ (5 分間隔) に任せる。
+
+  // 会話を切り替えたら「新着あり」の導線は捨てる (前の会話の状態なので)
+  useEffect(() => {
+    setHasUnseenMessages(false)
+    atBottomRef.current = true
+  }, [selectedChatId])
 
   // 引用元は開いている会話のメッセージなので、会話が変わったら必ず捨てる。
   // handleSelectChat 以外にも「次の未対応 →」やディープリンクなど
@@ -585,12 +732,30 @@ export default function ChatsPage() {
 
   // 詳細が新しくロードされたら最下部（＝最新メッセージ）までスクロールする。
   // そこから上にスクロールすれば過去のメッセージを辿れる（LINE受信画面と同じUX）。
-  // ユーザーが手動でスクロールしたら delayed auto-scroll は発動させない。
+  //
+  // メッセージが増えたとき (ポーリングでの新着 / 自分の送信) の扱い:
+  // - チャットを開いた直後 (= チャット切替) は無条件に最下部へ
+  // - 自分が送信したときも最下部へ (forceScrollToBottomRef)
+  // - それ以外は「増える前に最下部付近を見ていたときだけ」追従する。
+  //   過去を遡って読んでいる最中に相手の新着で最下部へ飛ばされると
+  //   読んでいた場所を見失うため。判定に使う距離は onScroll 時点の値
+  //   (= 増える前の位置) を atBottomRef に持っている。
   useEffect(() => {
     if (!chatDetail?.messages || chatDetail.messages.length === 0) return
     const el = messagesScrollRef.current
     if (!el) return
+
+    const isChatSwitch = scrolledChatIdRef.current !== chatDetail.id
+    scrolledChatIdRef.current = chatDetail.id
+    const forced = forceScrollToBottomRef.current
+    forceScrollToBottomRef.current = false
+    const follow = isChatSwitch || forced || atBottomRef.current
+    if (!follow) return
+
     el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setHasUnseenMessages(false)
+
     let userScrolled = false
     const onScroll = () => {
       if (!messagesScrollRef.current) return
@@ -611,6 +776,26 @@ export default function ChatsPage() {
       el.removeEventListener('scroll', onScroll)
     }
   }, [chatDetail?.id, chatDetail?.messages?.length])
+
+  // メッセージ一覧のスクロール位置の追跡。
+  // ここで「最下部付近か」を持っておくのが要点 — 新着が増えた後に測ると
+  // 追加分の高さでしきい値を超えてしまい、最下部にいたのに追従しなくなる。
+  const handleMessagesScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    const el = event.currentTarget
+    const atBottom = shouldFollowScroll(el.scrollHeight - el.scrollTop - el.clientHeight)
+    atBottomRef.current = atBottom
+    // 最下部まで戻ってきたら新着はもう見えているので導線を消す
+    if (atBottom) setHasUnseenMessages(false)
+  }, [])
+
+  // 「新着メッセージ ↓」から最下部へ。
+  const scrollMessagesToBottom = useCallback(() => {
+    const el = messagesScrollRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setHasUnseenMessages(false)
+  }, [])
 
   // 引用プレビューの出し入れでコンポーザーの高さが変わり、メッセージ一覧が縮む/伸びる。
   // 最下部付近を見ていたときだけ追従させる — 過去を遡って引用したときに
@@ -727,6 +912,8 @@ export default function ChatsPage() {
         })
         await api.chats.send(sendingChatId, { messageType: 'image', content: imgPayload })
         setPendingImage(null)
+        // 自分が送ったときは、過去を遡って読んでいても最下部へ戻す
+        forceScrollToBottomRef.current = true
         // Optimistic update for image
         setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
           ...prev,
@@ -740,6 +927,9 @@ export default function ChatsPage() {
               messageType: 'image',
               content: imgPayload,
               createdAt: now,
+              // サーバー未確認のローカル行。ポーリングの since から除外され、
+              // サーバー版が返ってきたら差し替えられる (id が違うため)
+              pending: true,
             },
           ],
         } : prev)
@@ -785,6 +975,8 @@ export default function ChatsPage() {
         })
         setMessageContent('')
         setQuotedMessageId(null)
+        // 自分が送ったときは、過去を遡って読んでいても最下部へ戻す
+        forceScrollToBottomRef.current = true
         // Optimistic update: append message locally instead of refetching (prevents scroll jump / full reload feel)
         // Only mutate chatDetail if it still corresponds to the chat we just sent to
         setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
@@ -804,6 +996,9 @@ export default function ChatsPage() {
               // なり引用できるようになる。
               quotable: false,
               quotedMessageId: quotedId ?? null,
+              // サーバー未確認のローカル行。ポーリングの since から除外され、
+              // サーバー版が返ってきたら差し替えられる (id が違うため)
+              pending: true,
             },
           ],
         } : prev)
@@ -1122,8 +1317,16 @@ export default function ChatsPage() {
                 </div>
               </div>
 
-              {/* Messages — LINE-style chat bubbles */}
-              <div ref={messagesScrollRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-2" style={{ backgroundColor: '#7494C0' }}>
+              {/* Messages — LINE-style chat bubbles。
+                  relative なラッパで包んでいるのは「新着メッセージ ↓」を
+                  一覧の上に浮かせるため (スクロール領域自体は従来どおり) */}
+              <div className="relative flex-1 min-h-0 flex flex-col">
+              <div
+                ref={messagesScrollRef}
+                onScroll={handleMessagesScroll}
+                className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-2"
+                style={{ backgroundColor: '#7494C0' }}
+              >
                 {(!chatDetail.messages || chatDetail.messages.length === 0) ? (
                   <div className="text-center py-8">
                     <p className="text-white/60 text-sm">メッセージはまだありません。</p>
@@ -1306,8 +1509,13 @@ export default function ChatsPage() {
                               )}
                               {!isOutgoing && quoteButton}
                             </div>
-                            {/* 時刻 */}
+                            {/* 時刻 + 送信者。
+                                sentByStaffName は「誰が返信したか」— 複数人で
+                                手動返信を回すとき、後から追えるようにする。
+                                null は異常ではなく普通に起きる (自動配信や
+                                /line-api 経由の送信) ので、そのときは何も出さない。 */}
                             <span className="text-xs text-white/50 mt-0.5 px-1">
+                              {isOutgoing && msg.sentByStaffName ? `${msg.sentByStaffName} · ` : ''}
                               {new Date(msg.createdAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
                             </span>
                           </div>
@@ -1316,6 +1524,18 @@ export default function ChatsPage() {
                     )
                   })
                 )}
+              </div>
+              {/* 過去を遡って読んでいる最中に新着が届いたときだけ出す控えめな導線。
+                  スクロール位置は勝手に動かさず、押されたときだけ最下部へ送る */}
+              {hasUnseenMessages && (
+                <button
+                  type="button"
+                  onClick={scrollMessagesToBottom}
+                  className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full bg-white/95 text-gray-700 text-xs shadow-md hover:bg-white"
+                >
+                  新着メッセージ ↓
+                </button>
+              )}
               </div>
 
               {/* Notes — PC(xl+)は右サイドバーに常設。狭い画面のみトグル表示 */}

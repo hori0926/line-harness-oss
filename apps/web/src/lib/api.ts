@@ -1004,8 +1004,16 @@ export const api = {
         '/api/chats?' + new URLSearchParams(query),
       )
     },
-    get: (id: string) =>
-      fetchApi<ApiResponse<Chat & {
+    // since (ISO8601) を渡すと created_at > since のメッセージだけが返る (差分取得)。
+    // 自動更新のポーリングは必ず since を付けること — 毎回全件 (直近1000件) を読むと
+    // D1 の 1 日あたりの行読み取り上限をすぐ超える。
+    // status / notes / friendName などメッセージ以外は since の有無に関係なく最新の完全な値が返る。
+    get: (id: string, params?: { since?: string }) => {
+      const query = params?.since ? '?' + new URLSearchParams({ since: params.since }) : ''
+      return fetchApi<ApiResponse<Chat & {
+        // true なら messages は差分、false / 未定義なら全件 (直近1000件)。
+        // 不正な since はサーバー側で全件取得にフォールバックする。
+        isDelta?: boolean
         messages?: {
           id: string
           content: string
@@ -1016,10 +1024,13 @@ export const api = {
           // quotedMessageId は、このメッセージが引用した元メッセージの id。
           quotable?: boolean
           quotedMessageId?: string | null
+          // 手動送信した担当者の名前。自動配信は null。
+          sentByStaffName?: string | null
         }[]
       }>>(
-        `/api/chats/${id}`,
-      ),
+        `/api/chats/${id}${query}`,
+      )
+    },
     create: (data: { friendId: string; operatorId?: string | null }) =>
       fetchApi<ApiResponse<Chat>>('/api/chats', {
         method: 'POST',
