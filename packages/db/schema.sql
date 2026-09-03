@@ -196,6 +196,11 @@ CREATE TABLE IF NOT EXISTS messages_log (
   quote_token      TEXT,
   -- 引用リプライで送信した際の引用元 messages_log.id。引用なしは NULL
   quoted_message_id TEXT,
+  -- 手動返信を送ったスタッフの id。自動配信・取得できない経路では NULL
+  sent_by_staff_id  TEXT,
+  -- 送信時点のスタッフ名のスナップショット。staff 行が消えても監査記録を残すため
+  -- 別に持つ (FK にしない)。自動配信は NULL
+  sent_by_staff_name TEXT,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
