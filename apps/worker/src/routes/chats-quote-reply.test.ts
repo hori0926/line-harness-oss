@@ -17,6 +17,8 @@ vi.mock('@line-crm/db', () => ({
   resolveDefaultAccessToken: vi.fn(),
   updateChat: vi.fn(),
   jstNow: vi.fn(() => '2026-09-03T12:00:00.000+09:00'),
+  // chats.ts の ?since= 正規化が使う。実装と同じ JST 表記に寄せる。
+  toJstString: (d: Date) => new Date(d.getTime() + 9 * 3_600_000).toISOString().slice(0, -1) + '+09:00',
 }));
 
 import {

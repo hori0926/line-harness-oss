@@ -14,6 +14,7 @@ import {
   resolveDefaultAccessToken,
   updateChat,
   jstNow,
+  toJstString,
 } from '@line-crm/db';
 import type { Env } from '../index.js';
 
@@ -99,6 +100,24 @@ async function resolveOrCreateChat(db: D1Database, id: string): Promise<ChatLike
     .prepare(`SELECT * FROM chats WHERE friend_id = ? ORDER BY created_at DESC LIMIT 1`)
     .bind(friend.id)
     .first<ChatLike>())!;
+}
+
+/**
+ * 差分ポーリング用 `?since=` の正規化。
+ *
+ * DB の messages_log.created_at は全ての書き込み経路が jstNow() を明示 bind して
+ * いるので 'YYYY-MM-DDTHH:mm:ss.sss+09:00' 固定。SQLite の比較は文字列比較なので、
+ * UTC の 'Z' 表記などで来ても正しく効くように同じ JST 表記へ寄せてから使う
+ * (フロントが受け取った createdAt をそのまま返す場合は round-trip で不変)。
+ *
+ * パースできない値は **エラーにせず null (= 全件取得) にフォールバック** する。
+ * ポーリングが 400 で壊れて画面が凍るより、多めに読むほうが運用上安全。
+ */
+function normalizeSince(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return toJstString(parsed);
 }
 
 /**
@@ -434,19 +453,48 @@ chats.get('/api/chats/:id', async (c) => {
       .bind(resolvedFriendId)
       .first<{ display_name: string | null; picture_url: string | null; line_user_id: string }>();
 
+    // 差分取得。`?since=` があるとその時刻より後のメッセージだけを返す。
+    //
+    // なぜ必要か: 全件モードは 1 リクエストで最大1000行を読む。フロントが10秒間隔で
+    // ポーリングすると オペレーター5人 × 8時間 × 6回/分 × 1000行 ≈ 1,440万行/日 になり、
+    // D1 無料枠 (500万行/日) を軽く超える。差分が無いとポーリング自体を導入できない。
+    //
+    // 比較は **排他的 (`>`)** — since と同時刻の行は既に手元にあるので返さない。
+    // これが `>=` だと毎回1件ずつ重複が届き、フロントのマージ処理に依存した
+    // 二重表示バグになる。
+    const since = normalizeSince(c.req.query('since'));
+    const isDelta = since !== null;
+
     // 新しい1000件を取って昇順に戻す。LIMIT 200 ASC だと古い200件だけで broadcast/scenario 等の
     // 新しい push が欠落していた（Shu で 481件中 281件欠落のバグあり）。一覧側と同様に test 配信は除外。
     // 現状の最重量ユーザー(481件)の2倍バッファ。これ以上の履歴はページング未実装（Phase 2 TODO）。
-    const messages = await c.env.DB
-      .prepare(
-        `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, created_at
-         FROM messages_log
-         WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
-         ORDER BY created_at DESC LIMIT 1000`,
-      )
-      .bind(resolvedFriendId)
-      .all();
-    messages.results = (messages.results as Record<string, unknown>[]).reverse();
+    //
+    // 差分モードは既に昇順で取れるので reverse しない。LIMIT 200 は「10秒の間に
+    // 200件を超えて届く」ことが 1:1 チャットでは起き得ないため十分で、万一溢れても
+    // 次回の since が進むので取りこぼしにはならない。
+    const messages = isDelta
+      ? await c.env.DB
+          .prepare(
+            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at
+             FROM messages_log
+             WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
+               AND created_at > ?
+             ORDER BY created_at ASC LIMIT 200`,
+          )
+          .bind(resolvedFriendId, since)
+          .all()
+      : await c.env.DB
+          .prepare(
+            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at
+             FROM messages_log
+             WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
+             ORDER BY created_at DESC LIMIT 1000`,
+          )
+          .bind(resolvedFriendId)
+          .all();
+    if (!isDelta) {
+      messages.results = (messages.results as Record<string, unknown>[]).reverse();
+    }
 
     return c.json({
       success: true,
@@ -460,6 +508,12 @@ chats.get('/api/chats/:id', async (c) => {
         notes,
         lastMessageAt,
         createdAt,
+        // このレスポンスが差分かどうか。true ならフロントは messages を既存配列に
+        // マージし、false なら置き換える。status / notes などメッセージ以外の
+        // フィールドは isDelta に関わらず常に最新の完全な値を返しているので、
+        // 差分レスポンスでもそのまま反映してよい (会話のステータス変化を
+        // ポーリングで検知できる)。
+        isDelta,
         messages: (messages.results as Record<string, unknown>[]).map((m) => ({
           id: m.id,
           direction: m.direction,
@@ -470,6 +524,10 @@ chats.get('/api/chats/:id', async (c) => {
           quotable: Boolean(m.quote_token),
           // 引用プレビューを同じ messages 配列から解決するために必要
           quotedMessageId: (m.quoted_message_id as string | null) ?? null,
+          // 手動返信を送ったスタッフ名。自動配信 (broadcast / scenario) は null。
+          // sent_by_staff_id は返さない — フロントは表示名しか使わないので、
+          // 使わない内部 ID を露出しない (quotable / quoteToken と同じ判断)。
+          sentByStaffName: (m.sent_by_staff_name as string | null) ?? null,
           createdAt: m.created_at,
         })),
       },
@@ -645,11 +703,20 @@ chats.post('/api/chats/:id/send', async (c) => {
       console.error('POST /api/chats/:id/send quoteToken extraction failed:', err);
     }
 
+    // 送信スタッフを記録する (複数スタッフ運用で「誰が返したか」を残すため)。
+    // authMiddleware が /api/ 全体に掛かっていて c.set('staff', staff) 済みなので
+    // 通常は必ず取れるが、取れない経路 (env API_KEY での owner フォールバックが
+    // 将来変わる / テスト等) でも **送信は絶対に失敗させない** — 両方 NULL で記録する。
+    // 名前は送信時点のスナップショット: staff 行が削除されても監査記録を残すため。
+    const staff = c.get('staff');
+    const sentByStaffId = staff?.id ?? null;
+    const sentByStaffName = staff?.name ?? null;
+
     // メッセージログに記録
     const logId = crypto.randomUUID();
     await c.env.DB
-      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, source, quote_token, quoted_message_id, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?, ?, ?)`)
-      .bind(logId, friend.id, messageType, body.content, sentQuoteToken, quotedMessageId, jstNow())
+      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, source, quote_token, quoted_message_id, sent_by_staff_id, sent_by_staff_name, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?, ?, ?, ?, ?)`)
+      .bind(logId, friend.id, messageType, body.content, sentQuoteToken, quotedMessageId, sentByStaffId, sentByStaffName, jstNow())
       .run();
 
     // チャットの最終メッセージ日時を更新（chat.id を直接使う — friend_id で呼ばれても resolveOrCreateChat 済み）
