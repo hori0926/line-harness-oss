@@ -1,4 +1,4 @@
-export { LineClient, LineApiError } from './client.js';
+export { LineClient, LineApiError, extractSentQuoteToken } from './client.js';
 export type {
   FollowersInsight,
   FollowerIdsPage,
@@ -44,8 +44,10 @@ export type {
   MulticastRequest,
   PostbackEvent,
   PushMessageRequest,
+  PushMessageResponse,
   ReplyMessageRequest,
   RoomSource,
+  SentMessage,
   Source,
   StickerEventMessage,
   TemplateMessage,

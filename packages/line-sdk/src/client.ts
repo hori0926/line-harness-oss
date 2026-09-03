@@ -5,7 +5,9 @@ import type {
   MulticastRequest,
   PushMessageRequest,
   ReplyMessageRequest,
+  PushMessageResponse,
   RichMenuObject,
+  TextMessage,
   UserProfile,
 } from './types.js';
 
@@ -113,12 +115,18 @@ export class LineClient {
 
   // ─── Messaging ───────────────────────────────────────────────────────────
 
+  /**
+   * push 送信。戻り値の sentMessages[].quoteToken を保存しておくと、
+   * あとから「自分が送ったメッセージ」も引用リプライの引用元にできる。
+   * LINE 側の仕様変更や 409 (retry key 済み) では sentMessages が無いので、
+   * 取り出しには extractSentQuoteToken() を使うこと。
+   */
   async pushMessage(
     to: string,
     messages: Message[],
     retryKey?: string,
     customAggregationUnits?: string[],
-  ): Promise<unknown> {
+  ): Promise<PushMessageResponse> {
     const body: PushMessageRequest = { to, messages, customAggregationUnits };
     const { data } = await this.request(
       'POST',
@@ -126,7 +134,7 @@ export class LineClient {
       body,
       retryKey ? { 'X-Line-Retry-Key': retryKey } : {},
     );
-    return data;
+    return (data ?? {}) as PushMessageResponse;
   }
 
   async multicast(
@@ -246,15 +254,21 @@ export class LineClient {
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
-  async pushTextMessage(to: string, text: string): Promise<unknown> {
-    return this.pushMessage(to, [{ type: 'text', text }]);
+  /**
+   * テキストを push 送信する。quoteToken を渡すと LINE 側で引用リプライになる。
+   * 未指定のときは quoteToken キー自体を送らない (LINE API は undefined を嫌う)。
+   */
+  async pushTextMessage(to: string, text: string, quoteToken?: string): Promise<PushMessageResponse> {
+    const message: TextMessage = { type: 'text', text };
+    if (quoteToken) message.quoteToken = quoteToken;
+    return this.pushMessage(to, [message]);
   }
 
   async pushFlexMessage(
     to: string,
     altText: string,
     contents: FlexContainer,
-  ): Promise<unknown> {
+  ): Promise<PushMessageResponse> {
     return this.pushMessage(to, [{ type: 'flex', altText, contents }]);
   }
 
@@ -262,7 +276,7 @@ export class LineClient {
     to: string,
     originalContentUrl: string,
     previewImageUrl: string,
-  ): Promise<unknown> {
+  ): Promise<PushMessageResponse> {
     return this.pushMessage(to, [{ type: 'image', originalContentUrl, previewImageUrl }]);
   }
 
@@ -368,4 +382,22 @@ export class LineClient {
     );
     return data as FollowerIdsPage;
   }
+}
+
+/**
+ * push / reply レスポンスから先頭メッセージの quoteToken を安全に取り出す。
+ *
+ * LINE は `{"sentMessages":[{"id":"...","quoteToken":"..."}]}` を返すが、
+ * 409 (retry key 済み)・仕様変更・引用非対応のメッセージ種別では欠ける。
+ * ここは「取れなければ null」に倒す — 送信自体は既に成功しているので、
+ * トークンが取れないことを理由に例外を投げてはいけない (再送=二重送信の元)。
+ */
+export function extractSentQuoteToken(response: unknown): string | null {
+  if (!response || typeof response !== 'object') return null;
+  const sent = (response as { sentMessages?: unknown }).sentMessages;
+  if (!Array.isArray(sent) || sent.length === 0) return null;
+  const first = sent[0];
+  if (!first || typeof first !== 'object') return null;
+  const token = (first as { quoteToken?: unknown }).quoteToken;
+  return typeof token === 'string' && token.length > 0 ? token : null;
 }
