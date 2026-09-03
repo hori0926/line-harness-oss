@@ -490,12 +490,15 @@ async function handleEvent(
     }
 
     const logId = crypto.randomUUID();
+    // quoteToken は sticker / image / video 等にも付く。LINE SDK の型には無いので安全に取り出す。
+    // 保存しておけば有効期限が無いため、後から管理画面の引用リプライで使える。
+    const quoteToken = (event.message as { quoteToken?: string }).quoteToken ?? null;
     await db
       .prepare(
-        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-         VALUES (?, ?, 'incoming', ?, ?, NULL, NULL, 'user', ?)`,
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, quote_token, created_at)
+         VALUES (?, ?, 'incoming', ?, ?, NULL, NULL, 'user', ?, ?)`,
       )
-      .bind(logId, friend.id, msg.type, finalContent, jstNow())
+      .bind(logId, friend.id, msg.type, finalContent, quoteToken, jstNow())
       .run();
     await awardActivityMileage(db, {
       eventType: 'message_received',
@@ -526,12 +529,15 @@ async function handleEvent(
     const logId = crypto.randomUUID();
 
     // 受信メッセージをログに記録
+    // quoteToken は LINE SDK の型に無いので安全に取り出す (無ければ NULL)。
+    // 有効期限が無いので保存しておけば、後から管理画面の引用リプライで使える。
+    const quoteToken = (event.message as { quoteToken?: string }).quoteToken ?? null;
     await db
       .prepare(
-        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-         VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'user', ?)`,
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, quote_token, created_at)
+         VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'user', ?, ?)`,
       )
-      .bind(logId, friend.id, incomingText, now)
+      .bind(logId, friend.id, incomingText, quoteToken, now)
       .run();
 
     await awardActivityMileage(db, {

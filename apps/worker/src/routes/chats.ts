@@ -439,7 +439,7 @@ chats.get('/api/chats/:id', async (c) => {
     // 現状の最重量ユーザー(481件)の2倍バッファ。これ以上の履歴はページング未実装（Phase 2 TODO）。
     const messages = await c.env.DB
       .prepare(
-        `SELECT id, friend_id, direction, message_type, content, created_at
+        `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, created_at
          FROM messages_log
          WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
          ORDER BY created_at DESC LIMIT 1000`,
@@ -465,6 +465,11 @@ chats.get('/api/chats/:id', async (c) => {
           direction: m.direction,
           messageType: m.message_type,
           content: m.content,
+          // quoteToken の実値は返さない (フロントは引用可否しか使わず、
+          // 送信時に渡すのは quotedMessageId のみ)。トークンは秘密情報として扱う。
+          quotable: Boolean(m.quote_token),
+          // 引用プレビューを同じ messages 配列から解決するために必要
+          quotedMessageId: (m.quoted_message_id as string | null) ?? null,
           createdAt: m.created_at,
         })),
       },
@@ -557,8 +562,39 @@ chats.post('/api/chats/:id/send', async (c) => {
     const chat = await resolveOrCreateChat(c.env.DB, chatId);
     if (!chat) return c.json({ success: false, error: 'Chat not found' }, 404);
 
-    const body = await c.req.json<{ messageType?: string; content: string }>();
+    const body = await c.req.json<{ messageType?: string; content: string; quotedMessageId?: string }>();
     if (!body.content) return c.json({ success: false, error: 'content is required' }, 400);
+
+    const messageType = body.messageType ?? 'text';
+    // 空文字は「引用なし」として扱う (DB に '' を残さない)
+    const quotedMessageId = body.quotedMessageId || null;
+
+    // 引用リプライは text のみ対応 (画像・Flex の引用は LINE 側の可否が確定できないため対象外)
+    if (quotedMessageId && messageType !== 'text') {
+      return c.json(
+        { success: false, error: '引用リプライはテキストメッセージのみ対応しています' },
+        400,
+      );
+    }
+
+    // 引用元の quoteToken を取得する。
+    // ⚠️ friend_id での絞り込みは必須 — id だけで引くと、他人の会話の messages_log.id を
+    //    渡すだけで別の友だちの quoteToken を引用できてしまう (越境)。
+    let quoteToken: string | null = null;
+    if (quotedMessageId) {
+      const quoted = await c.env.DB
+        .prepare(`SELECT quote_token FROM messages_log WHERE id = ? AND friend_id = ?`)
+        .bind(quotedMessageId, chat.friend_id)
+        .first<{ quote_token: string | null }>();
+      if (!quoted || !quoted.quote_token) {
+        // 黙って引用なしで送らない。オペレーターは引用したくて送っているので明示的に失敗させる。
+        return c.json(
+          { success: false, error: '引用元のメッセージが見つからないか、引用できません' },
+          400,
+        );
+      }
+      quoteToken = quoted.quote_token;
+    }
 
     const { friend, accessToken } = await resolveFriendAndAccessToken(
       c.env.DB,
@@ -568,32 +604,52 @@ chats.post('/api/chats/:id/send', async (c) => {
     if (!friend) return c.json({ success: false, error: 'Friend not found' }, 404);
 
     // LINE APIでメッセージ送信
-    const { LineClient } = await import('@line-crm/line-sdk');
+    const { LineClient, extractSentQuoteToken } = await import('@line-crm/line-sdk');
     const lineClient = new LineClient(accessToken);
-    const messageType = body.messageType ?? 'text';
 
+    let pushResponse: unknown = null;
     if (messageType === 'text') {
-      await lineClient.pushTextMessage(friend.line_user_id, body.content);
+      pushResponse = await lineClient.pushTextMessage(
+        friend.line_user_id,
+        body.content,
+        quoteToken ?? undefined,
+      );
     } else if (messageType === 'flex') {
       const contents = JSON.parse(body.content);
-      await lineClient.pushFlexMessage(friend.line_user_id, extractFlexAltText(contents), contents);
+      pushResponse = await lineClient.pushFlexMessage(
+        friend.line_user_id,
+        extractFlexAltText(contents),
+        contents,
+      );
     } else if (messageType === 'image') {
       const parsed = JSON.parse(body.content) as {
         originalContentUrl: string;
         previewImageUrl: string;
       };
-      await lineClient.pushImageMessage(
+      pushResponse = await lineClient.pushImageMessage(
         friend.line_user_id,
         parsed.originalContentUrl,
         parsed.previewImageUrl,
       );
     }
 
+    // 送信済みメッセージの quoteToken を控えておくと、オペレーター自身が送った
+    // メッセージも後から引用できる (LINE アプリと同じ挙動)。
+    // 取れなくても送信は成功しているので、ここでは決して失敗させない
+    // (例外を投げるとオペレーターが再送し二重送信になる)。/line-api プロキシの
+    // 「ログ失敗は送信を壊さない」方針に揃える。
+    let sentQuoteToken: string | null = null;
+    try {
+      sentQuoteToken = extractSentQuoteToken(pushResponse);
+    } catch (err) {
+      console.error('POST /api/chats/:id/send quoteToken extraction failed:', err);
+    }
+
     // メッセージログに記録
     const logId = crypto.randomUUID();
     await c.env.DB
-      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, source, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?)`)
-      .bind(logId, friend.id, messageType, body.content, jstNow())
+      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, source, quote_token, quoted_message_id, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?, ?, ?)`)
+      .bind(logId, friend.id, messageType, body.content, sentQuoteToken, quotedMessageId, jstNow())
       .run();
 
     // チャットの最終メッセージ日時を更新（chat.id を直接使う — friend_id で呼ばれても resolveOrCreateChat 済み）
