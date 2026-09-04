@@ -15,6 +15,10 @@ import {
   resolveQuoteExcerpt,
 } from './quote-reply'
 import {
+  isMediaMessageType,
+  resolveMediaContent,
+} from './media-content'
+import {
   DETAIL_POLL_INTERVAL_MS,
   applyChatListRow,
   countNewMessages,
@@ -120,6 +124,89 @@ function StickerMessageImage({ content }: { content: string }) {
       onError={() => setFailed(true)}
     />
   )
+}
+
+/**
+ * 受信メディア (動画 / 音声 / ファイル) のバブル中身。
+ *
+ * content の解釈は media-content.ts に切り出してあり、JSON が壊れていても
+ * URL が欠けていても必ず fallback (従来のラベル文字列) が返るので、
+ * ここで JSON.parse の例外を気にする必要はない。
+ *
+ * 高さを固定しているのが要点 — 動画はメタデータ読み込み後に本来の
+ * アスペクト比へ変わるが、そのときに高さが動くと、過去を遡って読んでいる
+ * ユーザーの表示位置が下にずれる (スクロール追従は「増える前に最下部付近に
+ * いたか」でしか判定していない)。高さを先に確定させておけば読み込みで
+ * レイアウトが伸びない。横幅だけが後から変わる分にはスクロールに影響しない。
+ */
+function MediaMessageContent({
+  messageType,
+  content,
+  isOutgoing,
+}: {
+  messageType: string
+  content: string
+  isOutgoing: boolean
+}) {
+  const media = resolveMediaContent(messageType, content)
+  // 副次情報 (長さ / サイズ) の色。引用ブロックと同じ流儀で向きに合わせる
+  const subTextClass = isOutgoing ? 'text-white/80' : 'text-gray-500'
+
+  if (media.kind === 'video') {
+    return (
+      <video
+        src={media.url}
+        poster={media.posterUrl ?? undefined}
+        controls
+        // メタデータだけ先に取る (自動再生はしない)。全体を先読みすると
+        // 履歴を開いただけで大量のデータ転送が発生する
+        preload="metadata"
+        playsInline
+        // 高さ固定 + object-contain。縦長動画でもバブルが縦に伸びない
+        className="h-[220px] max-w-full rounded bg-black/10 object-contain"
+      />
+    )
+  }
+
+  if (media.kind === 'audio') {
+    return (
+      <div className="flex flex-col gap-1">
+        {/* audio のネイティブコントロールは高さが固定なので読み込みで伸びない */}
+        <audio src={media.url} controls preload="metadata" className="w-[240px] max-w-full" />
+        {media.durationLabel && <span className={`text-xs ${subTextClass}`}>{media.durationLabel}</span>}
+      </div>
+    )
+  }
+
+  if (media.kind === 'file') {
+    return (
+      // 配信側 (/images/:key) が file にだけ Content-Disposition: attachment を
+      // 付ける (公開ルートでの保存型 XSS 対策)。つまり PDF もビューアでは開かず
+      // そのままダウンロードされる。attachment はページ遷移を起こさないので
+      // target="_blank" は付けない — 空のタブが開いて閉じるだけになる。
+      // R2 は別オリジンなので download 属性もブラウザに無視される (付けない)。
+      <a
+        href={media.url}
+        title={`${media.fileName} をダウンロード`}
+        className="flex max-w-full min-w-0 items-center gap-2 no-underline hover:opacity-80"
+      >
+        <span
+          className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded text-[10px] font-bold ${
+            isOutgoing ? 'bg-white/20 text-white' : 'bg-gray-100 text-gray-600'
+          }`}
+        >
+          {media.extension ?? '📎'}
+        </span>
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate underline">{media.fileName}</span>
+          {media.sizeLabel && <span className={`text-xs ${subTextClass}`}>{media.sizeLabel}</span>}
+        </span>
+      </a>
+    )
+  }
+
+  // 保存に失敗した / マイグレーション以前のメッセージ。従来どおりラベルを出す
+  return <span>{media.label}</span>
 }
 
 function formatDatetime(iso: string | null): string {
@@ -1393,6 +1480,18 @@ export default function ChatsPage() {
                       }
                     } else if (msg.messageType === 'sticker') {
                       bubbleContent = <StickerMessageImage content={msg.content} />
+                    } else if (isMediaMessageType(msg.messageType)) {
+                      // 動画 / 音声 / ファイル。要素の位置と型がポーリング前後で
+                      // 変わらないので、15 秒ごとの再描画でも <video> の DOM は
+                      // 再利用され、再生中の動画が止まったり頭出しに戻ったりしない
+                      // (key は上位の msg.id 固定 = content を key にしていない)
+                      bubbleContent = (
+                        <MediaMessageContent
+                          messageType={msg.messageType}
+                          content={msg.content}
+                          isOutgoing={isOutgoing}
+                        />
+                      )
                     } else {
                       bubbleContent = <span>{msg.content}</span>
                     }
