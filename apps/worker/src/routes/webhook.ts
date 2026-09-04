@@ -447,6 +447,8 @@ async function handleEvent(
       id: string;
       type: string;
       fileName?: string;
+      fileSize?: number;
+      duration?: number;
       title?: string;
       packageId?: string | number;
       package_id?: string | number;
@@ -465,7 +467,7 @@ async function handleEvent(
     };
     const content = labels[msg.type] ?? `[${msg.type}]`;
 
-    // image の場合は LINE Content API でバイナリを取得 → R2 → JSON URL に置換。
+    // image / video / audio / file は LINE Content API でバイナリを取得 → R2 → JSON URL に置換。
     // 失敗時は labels[msg.type] のラベル文字列のまま (フォールバック)。
     let finalContent = content;
     if (msg.type === 'sticker') {
@@ -486,6 +488,31 @@ async function handleEvent(
       });
       if (refs) {
         finalContent = JSON.stringify(refs);
+      }
+    }
+    // video / audio / file も同じ流儀で R2 に保存し、content を JSON に置換する。
+    // 保存は ReadableStream のままストリーミングで行い、サイズ上限を超えるものや
+    // 取得失敗はラベル文字列のまま (fetchAndStoreIncomingMedia が null を返す)。
+    // ここは try で囲って、万一の例外で webhook 全体 (=inbox 記録) を壊さない。
+    if ((msg.type === 'video' || msg.type === 'audio' || msg.type === 'file') && r2 && workerUrl) {
+      try {
+        const { fetchAndStoreIncomingMedia } = await import('../services/incoming-media.js');
+        const media = await fetchAndStoreIncomingMedia({
+          r2,
+          workerUrl,
+          channelAccessToken: lineAccessToken,
+          accountId: lineAccountId ?? 'unknown',
+          messageId: msg.id,
+          kind: msg.type,
+          duration: msg.duration,
+          fileName: msg.fileName,
+          fileSize: msg.fileSize,
+        });
+        if (media) {
+          finalContent = JSON.stringify(media);
+        }
+      } catch (err) {
+        console.error('[webhook] incoming media store failed', { err, messageType: msg.type });
       }
     }
 

@@ -39,9 +39,10 @@ describe('fetchAndStoreIncomingImage', () => {
     );
     expect(r2.put).toHaveBeenCalled();
     const [key, , opts] = r2.put.mock.calls[0];
-    expect(key).toBe('incoming-acc-1-msg-xyz.jpg');
+    // キーには推測不能な UUID が混ざる (公開ルートの総当たり対策)
+    expect(key).toMatch(/^incoming-acc-1-msg-xyz-[0-9a-f-]{36}\.jpg$/);
     expect(opts.httpMetadata?.contentType).toBe('image/jpeg');
-    expect(result?.originalContentUrl).toBe('https://worker.example.com/images/incoming-acc-1-msg-xyz.jpg');
+    expect(result?.originalContentUrl).toBe(`https://worker.example.com/images/${key}`);
     expect(result?.previewImageUrl).toBe(result?.originalContentUrl);
   });
 
@@ -103,6 +104,6 @@ describe('fetchAndStoreIncomingImage', () => {
     });
 
     const [key] = r2.put.mock.calls[0];
-    expect(key).toBe('incoming-a-m-png.png');
+    expect(key).toMatch(/^incoming-a-m-png-[0-9a-f-]{36}\.png$/);
   });
 });

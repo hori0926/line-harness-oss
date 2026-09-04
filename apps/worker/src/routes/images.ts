@@ -72,7 +72,66 @@ images.post('/api/images', async (c) => {
   }
 });
 
-// GET /images/:key — serve image (public, no auth)
+/**
+ * Range ヘッダを R2Range に変換する。単一レンジのみ対応 (マルチパートレンジは
+ * 動画シークでは使われないので 200 で全体を返すことで足りる)。
+ * 解釈できない場合は null を返し、呼び出し元は通常の 200 応答にフォールバックする。
+ */
+function parseRangeHeader(value: string | undefined): R2Range | null {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match) return null;
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === '' && rawEnd === '') return null;
+  if (rawStart === '') {
+    const suffix = Number(rawEnd);
+    return suffix > 0 ? { suffix } : null;
+  }
+  const start = Number(rawStart);
+  if (rawEnd === '') return { offset: start };
+  const end = Number(rawEnd);
+  if (end < start) return null;
+  return { offset: start, length: end - start + 1 };
+}
+
+/** R2 が解決したレンジ (無ければリクエスト側の指定) を [start, end] に落とす。 */
+function resolveRange(range: R2Range, size: number): { start: number; end: number } | null {
+  let start: number;
+  let end: number;
+  if ('suffix' in range) {
+    start = Math.max(0, size - range.suffix);
+    end = size - 1;
+  } else {
+    start = range.offset ?? 0;
+    end = range.length != null ? start + range.length - 1 : size - 1;
+  }
+  end = Math.min(end, size - 1);
+  if (size === 0 || start >= size || end < start) return null;
+  return { start, end };
+}
+
+/**
+ * ダウンロード時のファイル名。日本語が化けないよう RFC 5987 の filename* を付け、
+ * 併せて ASCII の filename= も出して古いクライアントに備える。
+ */
+/** customMetadata.downloadName は percent-encode して保存されている (incoming-media.ts 参照)。 */
+function decodeDownloadName(raw: string | undefined): string | null {
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw) || null;
+  } catch {
+    return raw;
+  }
+}
+
+function contentDispositionAttachment(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
+  // encodeURIComponent は !'()* を残すが RFC 5987 の attr-char ではないので個別に潰す。
+  const encoded = encodeURIComponent(name).replace(/['()!*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+// GET /images/:key — serve image / video / audio / file (public, no auth)
 images.get('/images/:key', async (c) => {
   const key = c.req.param('key');
   // Public route: only flat "{uuid}.{ext}" keys are servable. Anything with a
@@ -80,7 +139,18 @@ images.get('/images/:key', async (c) => {
   if (key.includes('/') || key.includes('\\')) {
     return c.json({ success: false, error: 'Image not found' }, 404);
   }
-  const object = await c.env.IMAGES.get(key);
+
+  // 動画のシークバーには 206 Partial Content が要る。Range が無い場合は従来通り 200。
+  const range = parseRangeHeader(c.req.header('Range'));
+
+  let object: R2ObjectBody | null;
+  try {
+    object = await c.env.IMAGES.get(key, range ? { range } : undefined);
+  } catch (err) {
+    // 不正な Range を R2 が拒否した場合。サイズが分からないので */* で 416 を返す。
+    console.error('GET /images/:key range get failed:', err);
+    return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */*', 'Accept-Ranges': 'bytes' } });
+  }
 
   if (!object) {
     return c.json({ success: false, error: 'Image not found' }, 404);
@@ -90,6 +160,27 @@ images.get('/images/:key', async (c) => {
   headers.set('Content-Type', object.httpMetadata?.contentType || 'image/png');
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   headers.set('ETag', object.etag);
+  headers.set('Accept-Ranges', 'bytes');
+
+  // 受信ファイル (incoming-media が保存したもの) だけ元のファイル名で
+  // ダウンロードさせる。画像/動画/音声には付けない (インライン再生が壊れるため)。
+  const downloadName = decodeDownloadName(object.customMetadata?.downloadName);
+  if (downloadName) {
+    headers.set('Content-Disposition', contentDispositionAttachment(downloadName));
+  }
+
+  if (range) {
+    const resolved = resolveRange(object.range ?? range, object.size);
+    if (!resolved) {
+      return new Response(null, {
+        status: 416,
+        headers: { 'Content-Range': `bytes */${object.size}`, 'Accept-Ranges': 'bytes' },
+      });
+    }
+    headers.set('Content-Range', `bytes ${resolved.start}-${resolved.end}/${object.size}`);
+    headers.set('Content-Length', String(resolved.end - resolved.start + 1));
+    return new Response(object.body, { status: 206, headers });
+  }
 
   return new Response(object.body, { headers });
 });
