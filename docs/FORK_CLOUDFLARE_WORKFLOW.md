@@ -65,9 +65,20 @@ Variables:
 
 | 名前 | 用途 |
 | --- | --- |
+| `LINE_HARNESS_CLOUDFLARE_DEPLOY` | `true` のときだけ fork 用 deploy workflow を実行する |
+| `WORKER_NAME` | deploy する Worker 名。未設定時は `your-worker-name` |
+| `PAGES_PROJECT_NAME` | deploy する Pages project 名。未設定時は `your-admin-name` |
 | `VITE_LIFF_ID` | LIFF ID |
 | `VITE_BOT_BASIC_ID` | LINE bot basic ID |
 | `VITE_CALENDAR_CONNECTION_ID` | Google Calendar 連携を使う場合だけ設定 |
+| `ADMIN_ORIGIN` | Pages と Worker が別 origin の場合の管理画面 URL |
+| `ADMIN_ALLOW_CROSS_SITE` | 別 origin 構成では `true`。cookie を `SameSite=None` にする |
+| `WORKER_URL` | Worker の公開 URL。設定時は Worker の deploy config に反映 |
+
+`LINE_HARNESS_CLOUDFLARE_DEPLOY=true` がない場合、fork では workflow 自体は
+起動しても deploy job がスキップされます。Pages と Worker が別 origin の
+通常構成では `ADMIN_ORIGIN` と `ADMIN_ALLOW_CROSS_SITE=true` も設定してください。
+cookie/CORS の構成は [Admin Authentication](ADMIN-AUTH.md) を参照してください。
 
 Worker secrets は `wrangler secret put` で Cloudflare 側に設定します。
 

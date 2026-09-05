@@ -15,7 +15,7 @@ Cloudflare 無料枠で動く。サーバー代 **0 円**。Claude Code から�
 
 [![クリックで YouTube を再生 — L Harness 導入の全手順](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**現バージョン**: v0.21.0 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
+**現バージョン**: v0.24.0 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
@@ -98,7 +98,7 @@ CLI が以下を全部やる:
 - **友だち管理** — Webhook 自動登録、プロフィール取得、カスタムメタデータ
 - **タグ** — 配信条件・シナリオトリガー
 - **スコアリング** — 行動ベースのリードスコア自動計算
-- **オペレーターチャット** — 管理画面から直接 1:1 返信
+- **オペレーターチャット** — 管理画面から直接 1:1 返信。引用返信、受信した動画・音声・ファイルの再生/ダウンロード、差分自動更新、送信担当者表示に対応
 - **Conversation Inbox** — 未返信の会話を放置時間順で一覧（自動配信は除外判定）
 - **重複検出** — `picture_url` 中間トークンで複数アカウント間の同一ユーザーを自動タグ付け
 
@@ -169,6 +169,8 @@ CLI が以下を全部やる:
 ## ドキュメント
 
 - [セットアップガイド (動画)](https://youtu.be/DiRuGaeq1sM)
+- [Fork + Cloudflare 運用ガイド](docs/FORK_CLOUDFLARE_WORKFLOW.md)
+- [チャット・引用返信・受信メディア API](docs/wiki/16-Chat-and-AutoReply.md)
 - [LINE で無料体験する](https://shudesu.github.io/line-harness-oss/)
 - [Googleカレンダー連携とライブCTA即時予約](docs/wiki/28-Google-Calendar-and-Webinar-Booking.md)
 - [npm: @line-harness/sdk](https://www.npmjs.com/package/@line-harness/sdk)
