@@ -1,4 +1,12 @@
-export { LineClient, LineApiError, extractSentQuoteToken } from './client.js';
+export {
+  LineClient,
+  LineApiError,
+  extractSentQuoteToken,
+  // ローカル開発専用のベース URL 差し替え。client.ts 冒頭の警告を必ず読むこと。
+  configureLineApiBase,
+  getLineApiBase,
+  getLineContentApiBase,
+} from './client.js';
 export type {
   FollowersInsight,
   FollowerIdsPage,

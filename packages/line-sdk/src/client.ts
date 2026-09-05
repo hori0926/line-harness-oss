@@ -11,7 +11,67 @@ import type {
   UserProfile,
 } from './types.js';
 
-const LINE_API_BASE = 'https://api.line.me';
+const LINE_API_BASE_DEFAULT = 'https://api.line.me';
+const LINE_CONTENT_API_BASE_DEFAULT = 'https://api-data.line.me';
+
+// ─── ローカル開発専用: LINE API のベース URL 差し替え ────────────────────────
+//
+// ⚠️ 警告 — これは **ローカル開発でモックサーバーに向けるためだけ** の逃げ道です。
+//
+//   本番・ステージングを含め、実際の顧客が友だち登録している LINE 公式アカウントを
+//   扱う環境では絶対に設定しないでください。ここを設定するということは、
+//   「チャネルアクセストークン」「友だちの LINE userId」「送受信メッセージ本文」
+//   「受信した画像・動画・PDF などのファイル本体」を、指定したホストへそのまま
+//   送り出すということです。設定ミス・タイプミス・コピーした .dev.vars の
+//   混入によって、顧客の個人情報とトークンが第三者のサーバーへ流出する経路に
+//   なり得ます。**設定した覚えのない環境では必ず未設定にしてください。**
+//
+//   未設定 (null / 空文字) のときは既定の本番 URL が使われ、挙動は従来と
+//   完全に同一です。この関数を呼ばない限り何も変わりません。
+//
+// 呼び出しは apps/worker/src/middleware/line-api-base.ts から
+// 環境変数 (LINE_API_BASE_URL / LINE_CONTENT_API_BASE_URL) を渡して行います。
+// module スコープに置いているのは、`new LineClient(token)` の呼び出し箇所が
+// コードベース全体に散っており、全部にベース URL を引き回すと本番コードの
+// シグネチャを開発都合で汚すため。
+let lineApiBaseOverride: string | null = null;
+let lineContentApiBaseOverride: string | null = null;
+
+function normalizeBase(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().replace(/\/+$/, '');
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * ローカル開発でのみ使うベース URL の上書き。**上の警告を必ず読むこと。**
+ * どちらも未指定 / 空なら本番の URL に戻る (= 既定の挙動)。
+ */
+export function configureLineApiBase(options: {
+  apiBaseUrl?: string | null;
+  contentApiBaseUrl?: string | null;
+}): void {
+  lineApiBaseOverride = normalizeBase(options.apiBaseUrl);
+  lineContentApiBaseOverride = normalizeBase(options.contentApiBaseUrl);
+  if (lineApiBaseOverride || lineContentApiBaseOverride) {
+    // 本番で万一設定された場合に気づけるよう、必ず 1 行残す。
+    console.warn(
+      '[line-sdk] LINE API base URL overridden (LOCAL DEV ONLY) — api=%s content=%s',
+      lineApiBaseOverride ?? LINE_API_BASE_DEFAULT,
+      lineContentApiBaseOverride ?? LINE_CONTENT_API_BASE_DEFAULT,
+    );
+  }
+}
+
+/** Messaging API のベース URL。未設定なら https://api.line.me。 */
+export function getLineApiBase(): string {
+  return lineApiBaseOverride ?? LINE_API_BASE_DEFAULT;
+}
+
+/** Content API (バイナリ配信) のベース URL。未設定なら https://api-data.line.me。 */
+export function getLineContentApiBase(): string {
+  return lineContentApiBaseOverride ?? LINE_CONTENT_API_BASE_DEFAULT;
+}
 
 export interface FollowersInsight {
   status: string;
@@ -62,7 +122,7 @@ export class LineClient {
     body?: unknown,
     requestHeaders: Record<string, string> = {},
   ): Promise<{ data: unknown; headers: Headers }> {
-    const url = `${LINE_API_BASE}${path}`;
+    const url = `${getLineApiBase()}${path}`;
 
     const options: RequestInit = {
       method,
@@ -235,7 +295,7 @@ export class LineClient {
   }
 
   async getDefaultRichMenuId(): Promise<string | null> {
-    const url = `${LINE_API_BASE}/v2/bot/user/all/richmenu`;
+    const url = `${getLineApiBase()}/v2/bot/user/all/richmenu`;
     const res = await fetch(url, {
       method: 'GET',
       headers: {
@@ -288,7 +348,7 @@ export class LineClient {
     imageData: ArrayBuffer,
     contentType: 'image/png' | 'image/jpeg' = 'image/png',
   ): Promise<void> {
-    const url = `https://api-data.line.me/v2/bot/richmenu/${encodeURIComponent(richMenuId)}/content`;
+    const url = `${getLineContentApiBase()}/v2/bot/richmenu/${encodeURIComponent(richMenuId)}/content`;
     const res = await fetch(url, {
       method: 'POST',
       headers: {

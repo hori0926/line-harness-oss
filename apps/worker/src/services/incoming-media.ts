@@ -4,8 +4,23 @@ import type {
   IncomingMediaContent,
   IncomingVideoContent,
 } from '@line-crm/shared';
+import { getLineContentApiBase } from '@line-crm/line-sdk';
 
-const LINE_CONTENT_API_BASE = 'https://api-data.line.me/v2/bot/message';
+/**
+ * LINE Content API (受信メディアのバイナリ取得) のベース。
+ *
+ * 実体は line-sdk 側の getLineContentApiBase() — 既定は
+ * `https://api-data.line.me` で、環境変数 LINE_CONTENT_API_BASE_URL が
+ * 設定されているときだけローカル開発用のモックサーバーに向く。
+ *
+ * ⚠️ 警告: 上書きは **ローカル開発専用**。実際の顧客が使うアカウントを扱う
+ * 環境で設定すると、チャネルアクセストークンと、顧客が送ってきた画像・動画・
+ * 音声・PDF の中身がそのまま指定ホストへ送られる (= 第三者への情報流出経路)。
+ * 詳細は packages/line-sdk/src/client.ts 冒頭の警告を参照。
+ */
+function lineContentApiMessageBase(): string {
+  return `${getLineContentApiBase()}/v2/bot/message`;
+}
 
 export type IncomingMediaKind = 'image' | 'video' | 'audio' | 'file';
 
@@ -178,6 +193,40 @@ function limitStream(body: ReadableStream<Uint8Array>, limit: number, label: str
   return transform.readable;
 }
 
+/**
+ * R2 の put() は「長さが分かっているストリーム」しか受け付けない
+ * (workerd: "Provided readable stream must have a known length
+ *  (request/response body or readable half of FixedLengthStream)")。
+ *
+ * fetch のレスポンス body は Content-Length があれば長さ既知だが、上の
+ * limitStream() が挟む TransformStream を通した時点でその情報は失われる。
+ * そのままだと put が必ず TypeError になり、動画・音声・ファイル・画像の
+ * すべてがラベル表示にフォールバックしてしまう (R2 スタブを使う単体テストでは
+ * 検出できない)。Content-Length が分かっているときは FixedLengthStream で
+ * 長さを再付与して R2 に渡す。
+ *
+ * Content-Length が無いときは長さを宣言しようがないので、これまで通り
+ * 素の TransformStream を返す (上限判定はストリーム側で効いたまま)。
+ * FixedLengthStream は Workers ランタイム固有のグローバルなので、Node で走る
+ * 単体テストではそのまま素通しになる。
+ */
+function withKnownLength(
+  stream: ReadableStream<Uint8Array>,
+  contentLengthHeader: string | null,
+): ReadableStream<Uint8Array> {
+  if (typeof FixedLengthStream === 'undefined') return stream;
+  if (contentLengthHeader === null) return stream;
+  const length = Number(contentLengthHeader);
+  if (!Number.isSafeInteger(length) || length < 0) return stream;
+
+  const fixed = new FixedLengthStream(length);
+  // 宣言した長さと実際のバイト数が食い違うと writable 側が error になり、
+  // put が reject する → 呼び出し元が null を返してラベルにフォールバックする。
+  // (握り潰すのは unhandled rejection を出さないためだけ。)
+  void stream.pipeTo(fixed.writable).catch(() => {});
+  return fixed.readable as ReadableStream<Uint8Array>;
+}
+
 async function fetchLineContent(
   opts: FetchAndStoreIncomingMediaOptions,
   path: string,
@@ -185,14 +234,17 @@ async function fetchLineContent(
   const fetcher = opts.fetch ?? fetch;
   let res: Response;
   try {
-    res = await fetcher(`${LINE_CONTENT_API_BASE}/${opts.messageId}/${path}`, {
+    res = await fetcher(`${lineContentApiMessageBase()}/${opts.messageId}/${path}`, {
       headers: { Authorization: `Bearer ${opts.channelAccessToken}` },
     });
   } catch (err) {
     console.error('incoming-media: fetch failed', { err, path, messageId: opts.messageId, accountId: opts.accountId });
     return null;
   }
-  if (!res.ok) {
+  // Get content の成功は 200 のみ。大きい動画/音声の準備中は LINE が 202 を返すが、
+  // その body はメディア本体ではないので R2 に保存してはいけない。
+  // 202 の再試行は durable queue 化と合わせて行う (現状はラベルへフォールバック)。
+  if (res.status !== 200) {
     console.error('incoming-media: non-200', { status: res.status, path, messageId: opts.messageId, accountId: opts.accountId });
     return null;
   }
@@ -237,7 +289,10 @@ async function storeFromResponse(
   }
 
   // arrayBuffer() を経由せずストリームのまま R2 に渡す (動画は 200MB あり得るため必須)。
-  const stream = limitStream(res.body, params.limit, 'incoming-media');
+  const stream = withKnownLength(
+    limitStream(res.body, params.limit, 'incoming-media'),
+    res.headers.get('Content-Length'),
+  );
 
   try {
     await opts.r2.put(params.key, stream, {

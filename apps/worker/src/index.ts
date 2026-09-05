@@ -14,6 +14,7 @@ import {
 import { scheduled } from './scheduled.js';
 import { TenantScheduler } from './durable-objects/tenant-scheduler.js';
 import { authMiddleware } from './middleware/auth.js';
+import { lineApiBaseMiddleware } from './middleware/line-api-base.js';
 import { rateLimitMiddleware } from './middleware/rate-limit.js';
 import { webhook } from './routes/webhook.js';
 import { friends } from './routes/friends.js';
@@ -151,6 +152,20 @@ export type Env = {
     // armed されない」という気づきにくい壊れ方をするので、変更するときは
     // 両方揃えること。実体は durable-objects/tenant-scheduler.ts の TenantScheduler。
     TENANT_SCHEDULER: DurableObjectNamespace<TenantScheduler>;
+    /**
+     * ⚠️ ローカル開発専用 — LINE Messaging API のベース URL 上書き
+     * (既定 https://api.line.me)。設定するとチャネルアクセストークン・
+     * 友だちの userId・メッセージ本文がそのまま指定ホストへ送られるため、
+     * 本番/ステージングでは絶対に設定しないこと。詳細と警告は
+     * middleware/line-api-base.ts と packages/line-sdk/src/client.ts を参照。
+     */
+    LINE_API_BASE_URL?: string;
+    /**
+     * ⚠️ ローカル開発専用 — LINE Content API のベース URL 上書き
+     * (既定 https://api-data.line.me)。受信画像・動画・音声・ファイルの
+     * 取得先。上と同じ理由で本番では設定禁止。
+     */
+    LINE_CONTENT_API_BASE_URL?: string;
   };
   Variables: {
     staff: { id: string; name: string; role: 'owner' | 'admin' | 'staff' };
@@ -190,6 +205,11 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-admin-api-key'],
   maxAge: 600,
 }));
+
+// LINE API ベース URL の適用 (未設定なら本番 URL のまま = 既定の挙動)。
+// ローカル開発でモックサーバーに向けるためだけの仕組み — 警告は
+// middleware/line-api-base.ts を参照。
+app.use('*', lineApiBaseMiddleware);
 
 // Rate limiting — runs before auth to block abuse early
 app.use('*', rateLimitMiddleware);

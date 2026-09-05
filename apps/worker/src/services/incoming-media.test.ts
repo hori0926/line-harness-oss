@@ -298,6 +298,23 @@ describe('fetchAndStoreIncomingMedia — 失敗時フォールバック', () => 
     expect(r2.put).not.toHaveBeenCalled();
   });
 
+  test('動画の準備中を示す 202 body をメディアとして保存しない', async () => {
+    const { r2 } = makeR2Stub();
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ message: 'processing' }),
+      { status: 202, headers: { 'Content-Type': 'application/json' } },
+    )) as unknown as typeof fetch;
+
+    const result = await fetchAndStoreIncomingMedia({
+      ...baseOpts(r2, fetchMock),
+      messageId: 'msg-processing',
+      kind: 'video',
+    });
+
+    expect(result).toBeNull();
+    expect(r2.put).not.toHaveBeenCalled();
+  });
+
   test('ネットワークエラーでも throw せず null', async () => {
     const { r2 } = makeR2Stub();
     const fetchMock = vi.fn(async () => {
