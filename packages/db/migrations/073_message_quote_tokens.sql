@@ -1,4 +1,4 @@
--- Migration NNN: 管理画面 1:1 チャットの「引用リプライ」対応
+-- Migration 073: 管理画面 1:1 チャットの「引用リプライ」対応
 --
 -- LINE Messaging API の quoteToken を messages_log に保存し、後からオペレーター
 -- が任意の受信メッセージを引用して返信できるようにする。

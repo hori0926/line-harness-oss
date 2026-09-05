@@ -76,8 +76,8 @@ const STAFF = { id: 'staff-7', name: '佐藤花子', role: 'staff' as const };
 
 /**
  * messages_log を最低限だけ模した fake D1。
- * - `created_at > ?` を **実際に評価する** ので、since の境界 (同時刻を含まない)
- *   をテストで固定できる。
+ * - `created_at >= ?` を **実際に評価する** ので、since と同時刻に後着した行も
+ *   取りこぼさないことをテストで固定できる。
  * - ORDER BY も見て並べ替えるので、差分モードが reverse していないことも検証できる。
  */
 function fakeDb(seed: LogRow[] = []) {
@@ -121,9 +121,9 @@ function fakeDb(seed: LogRow[] = []) {
           if (sql.includes('FROM messages_log')) {
             const [friendId, since] = statement.params as [string, string | undefined];
             let results = rows.filter((r) => r.friend_id === friendId);
-            // 実装と同じく文字列比較・排他 (>) で絞る
-            if (sql.includes('created_at > ?') && since !== undefined) {
-              results = results.filter((r) => r.created_at > since);
+            // 実装と同じく文字列比較・包含 (>=) で絞る
+            if (sql.includes('created_at >= ?') && since !== undefined) {
+              results = results.filter((r) => r.created_at >= since);
             }
             results = [...results].sort((a, b) =>
               sql.includes('ORDER BY created_at DESC')
@@ -316,7 +316,7 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
     },
   ];
 
-  test('since より後の行だけを返す (同時刻の行は含まない = 排他比較)', async () => {
+  test('since と同時刻の行も返す (後着した同一ミリ秒の行を取りこぼさない)', async () => {
     const { db, queries } = fakeDb(SEED);
 
     const res = await get(db, '?since=2026-09-03T11:00:00.000%2B09:00');
@@ -324,12 +324,12 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
     expect(res.status).toBe(200);
     const { data } = await getBody(res);
     expect(data.isDelta).toBe(true);
-    // msg-boundary は since と完全に同時刻 → 含まれない
-    expect(data.messages.map((m) => m.id)).toEqual(['msg-new']);
+    // msg-boundary は since と完全に同時刻でも再取得する。画面側が id で重複除去する。
+    expect(data.messages.map((m) => m.id)).toEqual(['msg-boundary', 'msg-new']);
 
     const select = messagesSelect(queries);
-    expect(select?.sql).toContain('created_at > ?');
-    expect(select?.sql).toContain('ORDER BY created_at ASC');
+    expect(select?.sql).toContain('created_at >= ?');
+    expect(select?.sql).toContain('ORDER BY created_at ASC, id ASC');
     expect(select?.sql).toContain('LIMIT 200');
     expect(select?.params).toEqual(['friend-1', '2026-09-03T11:00:00.000+09:00']);
   });
@@ -342,7 +342,7 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
 
     expect(res.status).toBe(200);
     const { data } = await getBody(res);
-    expect(data.messages.map((m) => m.id)).toEqual(['msg-new']);
+    expect(data.messages.map((m) => m.id)).toEqual(['msg-boundary', 'msg-new']);
     expect(messagesSelect(queries)?.params).toEqual([
       'friend-1',
       '2026-09-03T11:00:00.000+09:00',
@@ -374,7 +374,7 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
     expect(data.messages.map((m) => m.id)).toEqual(['msg-old', 'msg-boundary', 'msg-new']);
 
     const select = messagesSelect(queries);
-    expect(select?.sql).not.toContain('created_at > ?');
+    expect(select?.sql).not.toContain('created_at >= ?');
     expect(select?.sql).toContain('ORDER BY created_at DESC LIMIT 1000');
     expect(select?.params).toEqual(['friend-1']);
   });
@@ -390,7 +390,7 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
       const { data } = await getBody(res);
       expect(data.isDelta).toBe(false);
       expect(data.messages).toHaveLength(3);
-      expect(messagesSelect(queries)?.sql).not.toContain('created_at > ?');
+      expect(messagesSelect(queries)?.sql).not.toContain('created_at >= ?');
     }
   });
 });

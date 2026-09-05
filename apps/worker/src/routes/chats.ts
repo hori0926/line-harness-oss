@@ -459,9 +459,9 @@ chats.get('/api/chats/:id', async (c) => {
     // ポーリングすると オペレーター5人 × 8時間 × 6回/分 × 1000行 ≈ 1,440万行/日 になり、
     // D1 無料枠 (500万行/日) を軽く超える。差分が無いとポーリング自体を導入できない。
     //
-    // 比較は **排他的 (`>`)** — since と同時刻の行は既に手元にあるので返さない。
-    // これが `>=` だと毎回1件ずつ重複が届き、フロントのマージ処理に依存した
-    // 二重表示バグになる。
+    // 比較は **包含 (`>=`)**。created_at はミリ秒精度なので、since と同時刻に
+    // 別メッセージが後着することがある。`>` だとその行を永久に取りこぼす。
+    // 境界の既存行も再取得されるが、フロントの mergeMessages が id で重複除去する。
     const since = normalizeSince(c.req.query('since'));
     const isDelta = since !== null;
 
@@ -478,8 +478,8 @@ chats.get('/api/chats/:id', async (c) => {
             `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at
              FROM messages_log
              WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
-               AND created_at > ?
-             ORDER BY created_at ASC LIMIT 200`,
+               AND created_at >= ?
+             ORDER BY created_at ASC, id ASC LIMIT 200`,
           )
           .bind(resolvedFriendId, since)
           .all()

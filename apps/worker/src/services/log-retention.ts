@@ -56,7 +56,8 @@ export async function runLogRetention(
       .prepare(
         `SELECT id, friend_id, direction, message_type, content, broadcast_id,
                 scenario_step_id, template_id_at_send, delivery_type, source,
-                line_account_id, created_at
+                line_account_id, quote_token, quoted_message_id,
+                sent_by_staff_id, sent_by_staff_name, created_at
            FROM messages_log WHERE created_at < ? ORDER BY created_at LIMIT ?`,
       )
       .bind(cutoff, RETENTION_BATCH_SIZE)

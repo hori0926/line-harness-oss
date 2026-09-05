@@ -1004,7 +1004,8 @@ export const api = {
         '/api/chats?' + new URLSearchParams(query),
       )
     },
-    // since (ISO8601) を渡すと created_at > since のメッセージだけが返る (差分取得)。
+    // since (ISO8601) を渡すと created_at >= since のメッセージだけが返る (差分取得)。
+    // 境界行は再取得されるが、画面側が id で重複除去する。
     // 自動更新のポーリングは必ず since を付けること — 毎回全件 (直近1000件) を読むと
     // D1 の 1 日あたりの行読み取り上限をすぐ超える。
     // status / notes / friendName などメッセージ以外は since の有無に関係なく最新の完全な値が返る。
