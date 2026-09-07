@@ -11,7 +11,7 @@
 
 [![点击在 YouTube 播放 — L Harness 配置教程](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**当前版本**: v0.13.2 ・ MIT 许可证 ・ TypeScript / Cloudflare Workers + D1
+**当前版本**: v0.24.0 ・ MIT 许可证 ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
@@ -74,7 +74,7 @@ CLI 自动完成以下全部步骤：
 - **好友管理** — Webhook 自动注册、profile 获取、自定义 metadata
 - **标签** — 推送条件与场景触发
 - **线索评分** — 基于行为的自动评分
-- **客服聊天** — 后台直接 1 对 1 回复
+- **客服聊天** — 后台直接 1 对 1 回复，支持引用回复、接收视频/音频/文件的播放与下载、增量自动刷新及发送员工标记
 - **会话收件箱** — 按未回复时间长度排序未答会话（自动推送不计入）
 - **好友去重** — 基于 `picture_url` 中段 token 跨多账号识别同一用户并自动打标
 

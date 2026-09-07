@@ -35,6 +35,16 @@ import type {
 } from '@line-crm/shared'
 import { getApiBase } from './api-base'
 
+// Keep an uncertain send's retry key across page reloads. No message text is stored.
+async function manualSendRequestId(chatId: string, data: unknown): Promise<{ key: string; id: string }> {
+  const bytes = new TextEncoder().encode(JSON.stringify({ chatId, data }));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const key = 'lh-send:' + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+  const id = sessionStorage.getItem(key) ?? crypto.randomUUID();
+  sessionStorage.setItem(key, id);
+  return { key, id };
+}
+
 /** Per-account delivery-health snapshot for the dashboard cards. */
 export type AccountDeliveryHealth = {
   lineAccountId: string
@@ -990,6 +1000,8 @@ export const api = {
       ),
   },
   chats: {
+    activity: () => fetchApi<ApiResponse<{ version: string }>>('/api/chats/activity'),
+    lease: (id: string) => fetchApi<ApiResponse<{ owned: boolean; staffName: string; expiresAt: number }>>(`/api/chats/${id}/lease`, { method: 'POST' }),
     list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean; limit?: number; beforeAt?: string; beforeId?: string }) => {
       const query: Record<string, string> = {}
       if (params?.status) query.status = params.status
@@ -1004,10 +1016,34 @@ export const api = {
         '/api/chats?' + new URLSearchParams(query),
       )
     },
-    get: (id: string) =>
-      fetchApi<ApiResponse<Chat & { messages?: { id: string; content: string; senderType: string; createdAt: string }[] }>>(
-        `/api/chats/${id}`,
-      ),
+    // since (ISO8601) を渡すと created_at >= since のメッセージだけが返る (差分取得)。
+    // 境界行は再取得されるが、画面側が id で重複除去する。
+    // 自動更新のポーリングは必ず since を付けること — 毎回全件 (直近1000件) を読むと
+    // D1 の 1 日あたりの行読み取り上限をすぐ超える。
+    // status / notes / friendName などメッセージ以外は since の有無に関係なく最新の完全な値が返る。
+    get: (id: string, params?: { since?: string }) => {
+      const query = params?.since ? '?' + new URLSearchParams({ since: params.since }) : ''
+      return fetchApi<ApiResponse<Chat & {
+        // true なら messages は差分、false / 未定義なら全件 (直近1000件)。
+        // 不正な since はサーバー側で全件取得にフォールバックする。
+        isDelta?: boolean
+        messages?: {
+          id: string
+          content: string
+          senderType: string
+          createdAt: string
+          // 引用リプライ: quotable が true なら、このメッセージを引用して返信できる
+          // (incoming / outgoing どちらもあり得る)。トークンの実値はサーバーから出さない。
+          // quotedMessageId は、このメッセージが引用した元メッセージの id。
+          quotable?: boolean
+          quotedMessageId?: string | null
+          // 手動送信した担当者の名前。自動配信は null。
+          sentByStaffName?: string | null
+        }[]
+      }>>(
+        `/api/chats/${id}${query}`,
+      )
+    },
     create: (data: { friendId: string; operatorId?: string | null }) =>
       fetchApi<ApiResponse<Chat>>('/api/chats', {
         method: 'POST',
@@ -1018,11 +1054,15 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(data),
       }),
-    send: (id: string, data: { content: string; messageType?: string }) =>
-      fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
-        method: 'POST',
-        body: JSON.stringify(data),
-      }),
+    // quotedMessageId は messageType: 'text' のときのみ指定可能 (画像に付けるとサーバーが 400)
+    send: async (id: string, data: { content: string; messageType?: string; quotedMessageId?: string }) => {
+      const request = await manualSendRequestId(id, data)
+      const result = await fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
+        method: 'POST', body: JSON.stringify({ ...data, requestId: request.id }),
+      })
+      if (result.success) sessionStorage.removeItem(request.key)
+      return result
+    },
   },
   reminders: {
     list: (params?: { accountId?: string }) => {

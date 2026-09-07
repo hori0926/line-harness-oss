@@ -2,9 +2,13 @@
 
 ## 概要
 
-L Harnessのチャット機能は、オペレーター（人間）が友だちと1対1でやり取りするための仕組みを提供する。自動応答機能と連携し、キーワードマッチによる自動返信と人間による手動対応をシームレスに統合する。
+L Harnessのチャット機能は、オペレーター（人間）が友だちと1対1でやり取りするための仕組みを提供する。自動応答機能と連携し、キーワードマッチによる自動返信と人間による手動対応をシームレスに統合する。手動対応では引用返信、受信した動画・音声・ファイルの再生/ダウンロード、差分自動更新、送信したスタッフ名の表示にも対応する。
 
 L社の「個別トーク」「自動応答」に相当する機能。
+
+このforkの `MANUAL_REPLY_ONLY=true` では署名検証後にQueueへの保存を待ち、
+consumerが会話・添付を保存する。以下の自動応答・イベントバス処理とcron配信は実行しない。
+[手動運用の接続・受入手順](../operations/manual-line-migration.md)も参照。
 
 ## アーキテクチャ
 
@@ -81,12 +85,26 @@ CREATE TABLE messages_log (
   content TEXT NOT NULL,         -- メッセージ内容
   broadcast_id TEXT REFERENCES broadcasts (id) ON DELETE SET NULL,
   scenario_step_id TEXT REFERENCES scenario_steps (id) ON DELETE SET NULL,
+  quote_token TEXT,              -- このメッセージを引用するとき LINE に渡すトークン
+  quoted_message_id TEXT REFERENCES messages_log (id) ON DELETE SET NULL,
+  sent_by_staff_id TEXT,         -- 手動送信した staff_members.id
+  sent_by_staff_name TEXT,       -- 送信時点のスタッフ名スナップショット
+  content_updated_at TEXT,       -- 添付の取得・失敗・復旧時の変更日時
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX idx_messages_log_friend_id ON messages_log (friend_id);
 CREATE INDEX idx_messages_log_created_at ON messages_log (created_at);
+CREATE INDEX idx_messages_log_friend_created ON messages_log (friend_id, created_at, id);
+CREATE INDEX idx_messages_friend_content_updated ON messages_log (friend_id, content_updated_at);
 ```
+
+受信した動画・音声・ファイルは LINE Content API から取得して R2 に保存し、
+`content` に表示用 URL、ファイル名、サイズなどの JSON を記録する。
+手動運用モードではQueueへの保存後にWebhookを成功させ、取得待ちの行を表示する。
+取得失敗は再試行し、上限到達時は取得失敗を表示してジョブをDLQへ残す。
+復旧時は元の受信日時を保持し、`content_updated_at` を更新する。
+従来モードでは取得失敗時にラベル表示へフォールバックする。
 
 ## チャットステータスライフサイクル
 
@@ -141,6 +159,8 @@ CREATE INDEX idx_messages_log_created_at ON messages_log (created_at);
 
 - メッセージ通数にカウント（月間の無料枠あり）
 - いつでも送信可能（replyToken不要）
+- テキスト送信時に引用元の `quoteToken` を渡すと引用返信になる
+- 送信レスポンスの `sentMessages[].quoteToken` も保存するため、自分が送ったメッセージを後から引用できる
 
 ## 自動応答ルール
 
@@ -291,6 +311,10 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats?status=in_
 ```bash
 curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID" \
   -H "Authorization: Bearer YOUR_API_KEY"
+
+# 前回取得時刻以降の差分だけ取得（管理画面の自動更新で使用）
+curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID?since=2026-03-22T15:30:00.000" \
+  -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
 **レスポンス:**
@@ -308,12 +332,16 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
     "notes": "VIP候補",
     "lastMessageAt": "2026-03-22T15:30:00.000",
     "createdAt": "2026-03-21T10:00:00.000",
+    "isDelta": false,
     "messages": [
       {
         "id": "msg-uuid-1",
         "direction": "incoming",
         "messageType": "text",
         "content": "料金について教えてください",
+        "quotable": true,
+        "quotedMessageId": null,
+        "sentByStaffName": null,
         "createdAt": "2026-03-22T14:00:00.000"
       },
       {
@@ -321,6 +349,9 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
         "direction": "outgoing",
         "messageType": "text",
         "content": "料金プランをご案内します...",
+        "quotable": true,
+        "quotedMessageId": "msg-uuid-1",
+        "sentByStaffName": "山田花子",
         "createdAt": "2026-03-22T14:05:00.000"
       },
       {
@@ -328,6 +359,9 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
         "direction": "incoming",
         "messageType": "text",
         "content": "ありがとうございます！検討します",
+        "quotable": true,
+        "quotedMessageId": null,
+        "sentByStaffName": null,
         "createdAt": "2026-03-22T15:30:00.000"
       }
     ]
@@ -335,7 +369,13 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
 }
 ```
 
-メッセージ履歴は最大200件、`created_at ASC` 順で返される。
+通常取得では最新1000件を `created_at ASC` 順で返す。`since` を指定した差分取得では
+境界時刻を含む最大200件を返し、`isDelta` が `true` になる。同じミリ秒の後着を
+取りこぼさないため境界行が再度含まれることがあるので、クライアントは `id` で重複除去する。
+`quoteToken` の実値は API レスポンスへ出さず、引用できるかどうかだけを `quotable` で返す。
+添付の変更も `contentUpdatedAt` として返す。次の `since` には各行の
+`contentUpdatedAt ?? createdAt` の最大値を使い、表示順には `createdAt` を使う。
+差分は変更日時順で返るため、古い添付の復旧も `id` で置き換える。
 
 #### チャット作成
 
@@ -379,12 +419,26 @@ curl -X PUT "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
 
 #### オペレーターからメッセージ送信
 
+以下は従来モードの例。`MANUAL_REPLY_ONLY=true` では担当者ごとの認証と、
+本文にUUID v4の `requestId` が必須。同一操作の再試行には同じIDと本文を使う。
+送信時に90秒の担当ロックを取得・更新し、別担当者の有効なロックがあれば409を返す。
+管理画面は `POST /api/chats/:id/lease` を20秒ごとに呼び、
+`{ owned, staffName, expiresAt }` によって送信可否を表示する。
+`GET /api/chats/activity` は一覧の更新通知用に `{ version }` を返す
+（どちらも通常の `{ success, data }` 形式）。
+
 ```bash
 # テキストメッセージ送信
 curl -X POST "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID/send" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "content": "お問い合わせありがとうございます！料金プランの詳細をお送りします。" }'
+
+# 同じ友だちの引用可能なメッセージへ引用返信
+curl -X POST "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID/send" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "content": "こちらの件について回答します。", "quotedMessageId": "msg-uuid-1" }'
 
 # Flexメッセージ送信
 curl -X POST "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID/send" \
@@ -406,7 +460,7 @@ curl -X POST "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID
 1. チャットIDからfriendIdを取得
 2. friendIdからline_user_idを取得
 3. LINE Messaging APIでpushMessage送信
-4. messages_logに `direction: 'outgoing'` で記録
+4. messages_logに `direction: 'outgoing'`、送信スタッフ、引用関係を記録
 5. チャットステータスを `in_progress` に更新、`last_message_at` を更新
 
 ---

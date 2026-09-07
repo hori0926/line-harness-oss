@@ -11,7 +11,7 @@ Runs on Cloudflare's free tier. **$0/month server cost.** Fully operable from Cl
 
 [![Click to play on YouTube — L Harness setup guide](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**Current version**: v0.13.2 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
+**Current version**: v0.24.0 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
@@ -74,7 +74,7 @@ Takes about 5 minutes. Once done, the dashboard at `https://<your-name>-admin.pa
 - **Friend management** — webhook auto-registration, profile fetching, custom metadata
 - **Tags** — segmentation conditions and scenario triggers
 - **Lead scoring** — automatic score calculation from behavior
-- **Operator chat** — direct 1:1 reply from the dashboard
+- **Operator chat** — direct 1:1 replies with quoting, incoming video/audio/file playback and downloads, incremental auto-refresh, and sender attribution
 - **Conversation inbox** — list unanswered conversations sorted by idle time (automated sends excluded)
 - **Friend deduplication** — auto-tag the same physical user across multiple accounts via `picture_url` token matching
 

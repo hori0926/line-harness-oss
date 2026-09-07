@@ -94,6 +94,9 @@ Small, focused PRs are easiest to review. A good PR includes:
   The upstream migration chain moves fast, so final numbers are assigned by
   maintainers at merge time. Do not pick the next free number yourself — it
   will almost always conflict by the time the PR lands.
+  A fork-local deployment PR is the exception when its release workflow only
+  discovers numeric filenames: allocate numbers against the fork's current
+  `main`, then re-check them after every upstream merge before deploying.
 
 ### PRs We Usually Do Not Merge As-Is
 
@@ -146,6 +149,36 @@ description. If you could not run tests, say why.
 
 For UI changes, screenshots are helpful. For behavior changes, include the
 before/after behavior and the command, route, or screen you used to verify it.
+
+### Local chat integration smoke test
+
+Chat, quote-reply, and incoming-media changes can be exercised without a real
+LINE channel. The local harness creates a disposable D1 database, serves valid
+media fixtures from a LINE-compatible mock, and sends signed webhook events.
+
+```bash
+# One-time/reset setup. Stop the Worker dev server before resetting D1.
+node scripts/dev/make-fixtures.mjs
+bash scripts/dev/apply-local-db.sh
+
+# Terminal 1: mock LINE Messaging/Content API
+node scripts/dev/line-mock-server.mjs
+
+# Terminal 2: Worker, then Terminal 3: admin UI
+pnpm dev:worker
+NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev:web
+
+# Seed friends, text/media messages, and normal/quoted operator replies.
+node scripts/dev/send-webhook.mjs
+```
+
+Put `LINE_API_BASE_URL=http://127.0.0.1:8790` and
+`LINE_CONTENT_API_BASE_URL=http://127.0.0.1:8790` in the ignored local file
+`apps/worker/.dev.vars`. Never set either variable in staging or production:
+they redirect LINE access tokens, user IDs, message text, and media downloads
+to the configured host. `send-webhook.mjs` accepts `--worker`, `--secret`,
+`--api-key`, and `--no-reply`; otherwise it reads `LINE_CHANNEL_SECRET` from
+the same local `.dev.vars` file and uses the seeded development owner key.
 
 ## Release and Sync Policy
 

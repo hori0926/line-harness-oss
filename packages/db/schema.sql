@@ -192,6 +192,15 @@ CREATE TABLE IF NOT EXISTS messages_log (
   delivery_type    TEXT CHECK (delivery_type IN ('push', 'reply', 'test')),
   source           TEXT,
   line_account_id  TEXT,
+  -- 受信メッセージの LINE quoteToken (引用リプライ用。有効期限なし)。引用不可の種別は NULL
+  quote_token      TEXT,
+  -- 引用リプライで送信した際の引用元 messages_log.id。引用なしは NULL
+  quoted_message_id TEXT,
+  -- 手動返信を送ったスタッフの id。自動配信・取得できない経路では NULL
+  sent_by_staff_id  TEXT,
+  -- 送信時点のスタッフ名のスナップショット。staff 行が消えても監査記録を残すため
+  -- 別に持つ (FK にしない)。自動配信は NULL
+  sent_by_staff_name TEXT,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
@@ -199,6 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_log_broadcast_id ON messages_log(broadca
 
 CREATE INDEX IF NOT EXISTS idx_messages_log_friend_id ON messages_log (friend_id);
 CREATE INDEX IF NOT EXISTS idx_messages_log_created_at ON messages_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_log_friend_created ON messages_log (friend_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_messages_log_friend_source ON messages_log (friend_id, source);
 CREATE INDEX IF NOT EXISTS idx_messages_log_friend_direction_created ON messages_log (friend_id, direction, created_at);
 

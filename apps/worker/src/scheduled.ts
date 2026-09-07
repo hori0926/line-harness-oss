@@ -22,6 +22,7 @@ import { sendBookingNotification } from './services/booking-notifier.js';
 import { DEFAULT_ACCOUNT_SETTINGS } from './services/booking-types.js';
 import { lineProxy } from './routes/line-proxy.js';
 import type { Env } from './index.js';
+import { applyLineApiBase } from './middleware/line-api-base.js';
 
 /**
  * 5分に1回だけ通すゲート。
@@ -66,6 +67,12 @@ export async function scheduled(
   env: Env['Bindings'],
   ctx: ExecutionContext,
 ): Promise<void> {
+  // cron / DO alarm は Hono の middleware を通らないので、ここでも
+  // LINE API ベース URL を適用する (未設定なら本番 URL のまま = 既定の挙動)。
+  applyLineApiBase(env);
+  // Manual migration must not start existing broadcasts or reminder automations.
+  if (env.MANUAL_REPLY_ONLY === 'true') return;
+
   // Get all active accounts from DB
   const dbAccounts = await getLineAccounts(env.DB);
 

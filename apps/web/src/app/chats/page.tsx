@@ -9,6 +9,24 @@ import CcPromptButton from '@/components/cc-prompt-button'
 import FlexPreviewComponent from '@/components/flex-preview'
 import FriendInfoSidebar from '@/components/chats/friend-info-sidebar'
 import ImageUploader, { type ImageUploaderValue } from '@/components/shared/image-uploader'
+import {
+  canQuoteMessage,
+  quotedMessageIdForSend,
+  resolveQuoteExcerpt,
+} from './quote-reply'
+import {
+  isMediaMessageType,
+  resolveMediaContent,
+} from './media-content'
+import {
+  DETAIL_POLL_INTERVAL_MS,
+  applyChatListRow,
+  countNewMessages,
+  mergeMessages,
+  shouldFollowScroll,
+  shouldPollChatDetail,
+  sinceForPoll,
+} from './message-sync'
 import { Button } from '@cloudflare/kumo/components/button'
 import { Checkbox } from '@cloudflare/kumo/components/checkbox'
 import { Input } from '@cloudflare/kumo/components/input'
@@ -37,6 +55,19 @@ interface ChatMessage {
   messageType: string
   content: string
   createdAt: string
+  /** true なら「このメッセージを引用して返信できる」(incoming / outgoing どちらもあり得る) */
+  quotable?: boolean
+  /** このメッセージが引用した元メッセージの id (同じ messages 配列内に居る想定) */
+  contentUpdatedAt?: string | null
+  quotedMessageId?: string | null
+  /** 手動送信した担当者の名前。自動配信 (シナリオ / 一斉配信) は null */
+  sentByStaffName?: string | null
+  /**
+   * 楽観更新でローカルに足しただけの行 (サーバー未確認)。
+   * ポーリングの since / マージで特別扱いするためのローカル専用フラグで、
+   * サーバーからは絶対に返ってこない。
+   */
+  pending?: boolean
 }
 
 // リッチメニューのタブ切替 (richmenuswitch) は、webhook が postback data
@@ -94,6 +125,89 @@ function StickerMessageImage({ content }: { content: string }) {
       onError={() => setFailed(true)}
     />
   )
+}
+
+/**
+ * 受信メディア (動画 / 音声 / ファイル) のバブル中身。
+ *
+ * content の解釈は media-content.ts に切り出してあり、JSON が壊れていても
+ * URL が欠けていても必ず fallback (従来のラベル文字列) が返るので、
+ * ここで JSON.parse の例外を気にする必要はない。
+ *
+ * 高さを固定しているのが要点 — 動画はメタデータ読み込み後に本来の
+ * アスペクト比へ変わるが、そのときに高さが動くと、過去を遡って読んでいる
+ * ユーザーの表示位置が下にずれる (スクロール追従は「増える前に最下部付近に
+ * いたか」でしか判定していない)。高さを先に確定させておけば読み込みで
+ * レイアウトが伸びない。横幅だけが後から変わる分にはスクロールに影響しない。
+ */
+function MediaMessageContent({
+  messageType,
+  content,
+  isOutgoing,
+}: {
+  messageType: string
+  content: string
+  isOutgoing: boolean
+}) {
+  const media = resolveMediaContent(messageType, content)
+  // 副次情報 (長さ / サイズ) の色。引用ブロックと同じ流儀で向きに合わせる
+  const subTextClass = isOutgoing ? 'text-white/80' : 'text-gray-500'
+
+  if (media.kind === 'video') {
+    return (
+      <video
+        src={media.url}
+        poster={media.posterUrl ?? undefined}
+        controls
+        // メタデータだけ先に取る (自動再生はしない)。全体を先読みすると
+        // 履歴を開いただけで大量のデータ転送が発生する
+        preload="metadata"
+        playsInline
+        // 高さ固定 + object-contain。縦長動画でもバブルが縦に伸びない
+        className="h-[220px] max-w-full rounded bg-black/10 object-contain"
+      />
+    )
+  }
+
+  if (media.kind === 'audio') {
+    return (
+      <div className="flex flex-col gap-1">
+        {/* audio のネイティブコントロールは高さが固定なので読み込みで伸びない */}
+        <audio src={media.url} controls preload="metadata" className="w-[240px] max-w-full" />
+        {media.durationLabel && <span className={`text-xs ${subTextClass}`}>{media.durationLabel}</span>}
+      </div>
+    )
+  }
+
+  if (media.kind === 'file') {
+    return (
+      // 配信側 (/images/:key) が file にだけ Content-Disposition: attachment を
+      // 付ける (公開ルートでの保存型 XSS 対策)。つまり PDF もビューアでは開かず
+      // そのままダウンロードされる。attachment はページ遷移を起こさないので
+      // target="_blank" は付けない — 空のタブが開いて閉じるだけになる。
+      // R2 は別オリジンなので download 属性もブラウザに無視される (付けない)。
+      <a
+        href={media.url}
+        title={`${media.fileName} をダウンロード`}
+        className="flex max-w-full min-w-0 items-center gap-2 no-underline hover:opacity-80"
+      >
+        <span
+          className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded text-[10px] font-bold ${
+            isOutgoing ? 'bg-white/20 text-white' : 'bg-gray-100 text-gray-600'
+          }`}
+        >
+          {media.extension ?? '📎'}
+        </span>
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate underline">{media.fileName}</span>
+          {media.sizeLabel && <span className={`text-xs ${subTextClass}`}>{media.sizeLabel}</span>}
+        </span>
+      </a>
+    )
+  }
+
+  // 保存に失敗した / マイグレーション以前のメッセージ。従来どおりラベルを出す
+  return <span>{media.label}</span>
 }
 
 function formatDatetime(iso: string | null): string {
@@ -343,8 +457,28 @@ export default function ChatsPage() {
   const [hasMoreChats, setHasMoreChats] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState('')
+  const [lease, setLease] = useState<{ owned: boolean; staffName: string; expiresAt: number } | null>(null)
+  useEffect(() => {
+    setLease(null)
+    if (!selectedChatId) return
+    let cancelled = false
+    const refresh = async () => {
+      if (document.visibilityState === 'hidden') { setLease(null); return }
+      try {
+        const res = await api.chats.lease(selectedChatId)
+        if (!cancelled) setLease(res.success ? res.data : null)
+      } catch { if (!cancelled) setLease(null) }
+    }
+    void refresh()
+    const timer = window.setInterval(refresh, 20_000)
+    document.addEventListener('visibilitychange', refresh)
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener('visibilitychange', refresh) }
+  }, [selectedChatId])
   const [messageContent, setMessageContent] = useState('')
   const [pendingImage, setPendingImage] = useState<ImageUploaderValue | null>(null)
+  // 引用リプライ: 引用する元メッセージの id。null = 引用なし。
+  // 画像とは排他 (サーバーが text 以外の引用を 400 で弾く)。
+  const [quotedMessageId, setQuotedMessageId] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
   const sendLockRef = useRef(false)
   const [notes, setNotes] = useState('')
@@ -356,6 +490,29 @@ export default function ChatsPage() {
   const isComposingRef = useRef(false)
   const messagesScrollRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // --- 自動更新 (ポーリング) 用 ---
+  // 「今この瞬間の値」をポーリングのコールバックから読むための ref 群。
+  // state を直接 useCallback の依存に入れると、送信のたびにコールバックが
+  // 作り直されてインターバルがリセットされてしまう。
+  const sendingRef = useRef(false)
+  const chatDetailRef = useRef<ChatDetail | null>(null)
+  const detailPollInFlightRef = useRef(false)
+  /**
+   * メッセージ一覧が最下部付近にあるか。スクロールのたびに更新する。
+   * 「メッセージが増える前」の位置を保持しているのが要点 — 増えた後に
+   * 測ると追加分の高さでしきい値を超え、最下部にいたのに追従しなくなる。
+   */
+  const atBottomRef = useRef(true)
+  /** 次の再描画で無条件に最下部へ送る (自分が送信したときだけ立てる) */
+  const forceScrollToBottomRef = useRef(false)
+  /** 直近のスクロール処理を行ったチャット。切替の検出に使う */
+  const scrolledChatIdRef = useRef<string | null>(null)
+  /** 過去を遡って読んでいる最中に新着が来た */
+  const [hasUnseenMessages, setHasUnseenMessages] = useState(false)
+
+  useEffect(() => { sendingRef.current = sending }, [sending])
+  useEffect(() => { chatDetailRef.current = chatDetail }, [chatDetail])
   // OAM(公式LINEマネージャー)風レイアウト: 添付・設定・メモは折りたたみ、
   // メッセージ表示領域を最大化する
   const [showImagePicker, setShowImagePicker] = useState(false)
@@ -408,8 +565,10 @@ export default function ChatsPage() {
     return params
   }, [statusFilter, selectedAccountId, unansweredOnly])
 
+  const [listChanged, setListChanged] = useState(false)
   const loadChats = useCallback(async () => {
     setLoading(true)
+    setListChanged(false)
     setError('')
     try {
       const chatRes = await api.chats.list(buildListParams(null))
@@ -486,6 +645,7 @@ export default function ChatsPage() {
   }, [sendMode])
 
   const loadChatDetail = useCallback(async (chatId: string) => {
+    detailPollInFlightRef.current = true
     setDetailLoading(true)
     setError('')
     try {
@@ -503,7 +663,79 @@ export default function ChatsPage() {
       const msg = err instanceof Error ? err.message : String(err)
       setError(`チャット詳細の読み込みに失敗しました: ${msg}`)
     } finally {
+      detailPollInFlightRef.current = false
       setDetailLoading(false)
+    }
+  }, [])
+
+  /**
+   * 自動更新 (差分取得)。loadChatDetail とは別物なので混同しないこと:
+   * - detailLoading を触らない (15 秒ごとに「読み込み中...」へ差し替わってしまう)
+   * - notes state を触らない (メモを編集中に上書きすると入力が消える)
+   * - messageContent / quotedMessageId / pendingImage は一切触らない
+   * - エラーバナーも出さない (通信が一瞬切れるたびにレイアウトが動くため)
+   *
+   * since には「今持っているサーバー由来メッセージの最新 createdAt」を渡す。
+   * 全件取得は毎回 1000 行読むので、ポーリングでは必ず差分にする。
+   */
+  const pollChatDetail = useCallback(async (chatId: string) => {
+    if (!shouldPollChatDetail({
+      documentHidden: typeof document !== 'undefined' && document.visibilityState === 'hidden',
+      sending: sendingRef.current || sendLockRef.current,
+      hasSelectedChat: Boolean(chatId),
+      requestInFlight: detailPollInFlightRef.current,
+    })) return
+
+    const prevMessages = chatDetailRef.current?.id === chatId
+      ? (chatDetailRef.current?.messages ?? [])
+      : []
+    const since = sinceForPoll(prevMessages)
+
+    detailPollInFlightRef.current = true
+    try {
+      const res = await api.chats.get(chatId, since ? { since } : undefined)
+      if (!res.success) return
+      const { isDelta: deltaFlag, ...detailFields } = res.data as unknown as ChatDetail & { isDelta?: boolean }
+      // isDelta が付いていなければ全件として扱う (置き換え) — 差分でないものを
+      // 差分としてマージすると重複が残るより取りこぼしの方が怖いので安全側に倒す。
+      const isDelta = deltaFlag === true
+      const incoming = detailFields.messages ?? []
+
+      const merged = mergeMessages(prevMessages, incoming, { isDelta })
+      const added = countNewMessages(prevMessages, merged)
+
+      setChatDetail((prev) => {
+        // 取得中にチャットを切り替えられていたら捨てる
+        if (!prev || prev.id !== chatId) return prev
+        return {
+          ...prev,
+          // messages 以外 (status / friendName / lastMessageAt など) は
+          // since の有無に関わらず常に最新の完全な値が返る
+          ...detailFields,
+          messages: mergeMessages(prev.messages ?? [], incoming, { isDelta }),
+        }
+      })
+
+      if (added > 0) {
+        // 一覧はコストが高すぎて再取得できない (1 回 16 万行) ので、今開いている
+        // 会話の行だけを送信後の楽観更新と同じ形でローカル更新する。
+        // プレビューは lastMessage* が空で返ることがあるので messages の末尾で補う。
+        const newest = merged[merged.length - 1]
+        setChats((prev) => applyChatListRow(prev, chatId, {
+          lastMessageAt: detailFields.lastMessageAt ?? newest?.createdAt ?? null,
+          lastMessageContent: detailFields.lastMessageContent ?? newest?.content ?? null,
+          lastMessageDirection: detailFields.lastMessageDirection ?? newest?.direction ?? null,
+          lastMessageType: detailFields.lastMessageType ?? newest?.messageType ?? null,
+          // status が来ていないときに undefined で上書きすると一覧のバッジが消える
+          ...(detailFields.status ? { status: detailFields.status } : {}),
+        }))
+        // 過去を遡って読んでいる最中なら、スクロールを動かさずに導線だけ出す
+        if (!atBottomRef.current) setHasUnseenMessages(true)
+      }
+    } catch {
+      // ベストエフォート。次の 15 秒で取り直せば足りるので UI には出さない
+    } finally {
+      detailPollInFlightRef.current = false
     }
   }, [])
 
@@ -529,6 +761,62 @@ export default function ChatsPage() {
       setChatDetail(null)
     }
   }, [selectedChatId, loadChatDetail])
+
+  // --- 自動更新: 選択中チャットの差分取得 (15 秒間隔) ---
+  // 複数人で手動返信を回すと、相手の新着も同僚の返信も画面に出ないまま
+  // 二重返信が起きる。それを埋めるのがこのポーリング。
+  // タブが非表示の間は止め、戻ってきたら即座に 1 回取得する
+  // (放置後に開いて古い画面を見せない)。
+  useEffect(() => {
+    if (!selectedChatId) return
+    const chatId = selectedChatId
+    const tick = () => { void pollChatDetail(chatId) }
+    const timer = window.setInterval(tick, DETAIL_POLL_INTERVAL_MS)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') tick()
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [selectedChatId, pollChatDetail])
+
+  // Poll an indexed marker, not the expensive full history/list query.
+  useEffect(() => {
+    let version: string | undefined
+    let cancelled = false
+    let busy = false
+    const tick = async () => {
+      if (document.hidden || busy) return
+      busy = true
+      try {
+        const res = await api.chats.activity()
+        if (!cancelled && res.success) {
+          if (version !== undefined && version !== res.data.version) setListChanged(true)
+          version = res.data.version
+        }
+      } catch { /* the normal refresh action reports connection errors */ }
+      finally { busy = false }
+    }
+    void tick()
+    const timer = window.setInterval(tick, 15_000)
+    document.addEventListener('visibilitychange', tick)
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener('visibilitychange', tick) }
+  }, [])
+
+  // 会話を切り替えたら「新着あり」の導線は捨てる (前の会話の状態なので)
+  useEffect(() => {
+    setHasUnseenMessages(false)
+    atBottomRef.current = true
+  }, [selectedChatId])
+
+  // 引用元は開いている会話のメッセージなので、会話が変わったら必ず捨てる。
+  // handleSelectChat 以外にも「次の未対応 →」やディープリンクなど
+  // setSelectedChatId を直接呼ぶ経路があるため、選択 id を単一の起点にする。
+  useEffect(() => {
+    setQuotedMessageId(null)
+  }, [selectedChatId])
 
   // Surface deep-linked chats in the sidebar even when the current account
   // filter or status filter would exclude them — otherwise the user replies
@@ -566,12 +854,30 @@ export default function ChatsPage() {
 
   // 詳細が新しくロードされたら最下部（＝最新メッセージ）までスクロールする。
   // そこから上にスクロールすれば過去のメッセージを辿れる（LINE受信画面と同じUX）。
-  // ユーザーが手動でスクロールしたら delayed auto-scroll は発動させない。
+  //
+  // メッセージが増えたとき (ポーリングでの新着 / 自分の送信) の扱い:
+  // - チャットを開いた直後 (= チャット切替) は無条件に最下部へ
+  // - 自分が送信したときも最下部へ (forceScrollToBottomRef)
+  // - それ以外は「増える前に最下部付近を見ていたときだけ」追従する。
+  //   過去を遡って読んでいる最中に相手の新着で最下部へ飛ばされると
+  //   読んでいた場所を見失うため。判定に使う距離は onScroll 時点の値
+  //   (= 増える前の位置) を atBottomRef に持っている。
   useEffect(() => {
     if (!chatDetail?.messages || chatDetail.messages.length === 0) return
     const el = messagesScrollRef.current
     if (!el) return
+
+    const isChatSwitch = scrolledChatIdRef.current !== chatDetail.id
+    scrolledChatIdRef.current = chatDetail.id
+    const forced = forceScrollToBottomRef.current
+    forceScrollToBottomRef.current = false
+    const follow = isChatSwitch || forced || atBottomRef.current
+    if (!follow) return
+
     el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setHasUnseenMessages(false)
+
     let userScrolled = false
     const onScroll = () => {
       if (!messagesScrollRef.current) return
@@ -592,6 +898,37 @@ export default function ChatsPage() {
       el.removeEventListener('scroll', onScroll)
     }
   }, [chatDetail?.id, chatDetail?.messages?.length])
+
+  // メッセージ一覧のスクロール位置の追跡。
+  // ここで「最下部付近か」を持っておくのが要点 — 新着が増えた後に測ると
+  // 追加分の高さでしきい値を超えてしまい、最下部にいたのに追従しなくなる。
+  const handleMessagesScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    const el = event.currentTarget
+    const atBottom = shouldFollowScroll(el.scrollHeight - el.scrollTop - el.clientHeight)
+    atBottomRef.current = atBottom
+    // 最下部まで戻ってきたら新着はもう見えているので導線を消す
+    if (atBottom) setHasUnseenMessages(false)
+  }, [])
+
+  // 「新着メッセージ ↓」から最下部へ。
+  const scrollMessagesToBottom = useCallback(() => {
+    const el = messagesScrollRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    atBottomRef.current = true
+    setHasUnseenMessages(false)
+  }, [])
+
+  // 引用プレビューの出し入れでコンポーザーの高さが変わり、メッセージ一覧が縮む/伸びる。
+  // 最下部付近を見ていたときだけ追従させる — 過去を遡って引用したときに
+  // 最下部へ吹き飛ばされると引用元を見失うので、上にいる場合は動かさない。
+  useEffect(() => {
+    const el = messagesScrollRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    // しきい値はプレビュー行の高さ (約 50px) 分の縮みを吸収できる程度に取る
+    if (distanceFromBottom <= 120) el.scrollTop = el.scrollHeight
+  }, [quotedMessageId])
 
   // Auto-resize textarea as messageContent grows
   useEffect(() => {
@@ -615,6 +952,8 @@ export default function ChatsPage() {
     setSelectedChatId(chatId)
     setMessageContent('')
     setPendingImage(null)
+    // 引用元は今の会話のメッセージなので、会話を切り替えたら必ず捨てる
+    setQuotedMessageId(null)
     setShowImagePicker(false)
     setShowComposerSettings(false)
     setShowMobileMemo(false)
@@ -665,8 +1004,22 @@ export default function ChatsPage() {
     }
   }, [showLoadingIndicator, loadingSeconds])
 
+  // 引用開始。画像とは排他 (サーバーが text 以外の引用を 400 で弾く) なので、
+  // 画像添付中は開始させず、空の画像ピッカーが開いていれば閉じて
+  // 「引用中に画像を足せてしまう」状態を作らせない。
+  const handleStartQuote = (messageId: string) => {
+    if (pendingImage) return
+    setQuotedMessageId(messageId)
+    setShowImagePicker(false)
+    // モバイルはソフトキーボードが勝手に開いてしまうのでデスクトップ (lg+) のみフォーカス
+    // — チャットを開いたときの自動フォーカスと同じ方針。
+    if (typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches) {
+      textareaRef.current?.focus()
+    }
+  }
+
   const handleSendMessage = async () => {
-    if (!selectedChatId || sending || sendLockRef.current) return
+    if (!selectedChatId || sending || sendLockRef.current || !lease?.owned) return
     if (!messageContent.trim() && !pendingImage) return
     const sendingChatId = selectedChatId  // capture the chat id for this send
     sendLockRef.current = true
@@ -681,6 +1034,8 @@ export default function ChatsPage() {
         })
         await api.chats.send(sendingChatId, { messageType: 'image', content: imgPayload })
         setPendingImage(null)
+        // 自分が送ったときは、過去を遡って読んでいても最下部へ戻す
+        forceScrollToBottomRef.current = true
         // Optimistic update for image
         setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
           ...prev,
@@ -694,6 +1049,9 @@ export default function ChatsPage() {
               messageType: 'image',
               content: imgPayload,
               createdAt: now,
+              // サーバー未確認のローカル行。ポーリングの since から除外され、
+              // サーバー版が返ってきたら差し替えられる (id が違うため)
+              pending: true,
             },
           ],
         } : prev)
@@ -729,8 +1087,18 @@ export default function ChatsPage() {
       // --- Text send path (runs independently — both paths execute when both image and text are present) ---
       if (messageContent.trim()) {
         const content = messageContent.trim()
-        await api.chats.send(sendingChatId, { content })
+        // 引用は text のときだけ。画像を添付していたら付けない (サーバーが 400 を返す)。
+        // 送信に失敗した場合は catch に抜けてここまで来ないので、引用状態は保持される
+        // (やり直せる)。
+        const quotedId = quotedMessageIdForSend(quotedMessageId, Boolean(pendingImage))
+        await api.chats.send(sendingChatId, {
+          content,
+          ...(quotedId ? { quotedMessageId: quotedId } : {}),
+        })
         setMessageContent('')
+        setQuotedMessageId(null)
+        // 自分が送ったときは、過去を遡って読んでいても最下部へ戻す
+        forceScrollToBottomRef.current = true
         // Optimistic update: append message locally instead of refetching (prevents scroll jump / full reload feel)
         // Only mutate chatDetail if it still corresponds to the chat we just sent to
         setChatDetail((prev) => (prev && prev.id === sendingChatId) ? {
@@ -745,6 +1113,14 @@ export default function ChatsPage() {
               messageType: 'text',
               content,
               createdAt: now,
+              // 送信直後はまだ引用トークンを取得していない (LINE の push レスポンス
+              // 由来なのでサーバー側にしか無い)。次回の再取得で quotable: true に
+              // なり引用できるようになる。
+              quotable: false,
+              quotedMessageId: quotedId ?? null,
+              // サーバー未確認のローカル行。ポーリングの since から除外され、
+              // サーバー版が返ってきたら差し替えられる (id が違うため)
+              pending: true,
             },
           ],
         } : prev)
@@ -837,6 +1213,11 @@ export default function ChatsPage() {
     // 使わない — バナーやモバイル URL バーの分ずれてコンポーザーがはみ出すため。
     <div className="flex flex-col flex-1 min-h-0 bg-white">
       {/* Error */}
+      {listChanged && (
+        <button type="button" onClick={() => void loadChats()} className="mb-2 rounded-lg bg-green-100 px-4 py-2 text-sm text-green-900">
+          会話一覧に更新があります。クリックして最新の一覧を表示
+        </button>
+      )}
       {error && (
         <div className="m-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
           {error}
@@ -1063,8 +1444,16 @@ export default function ChatsPage() {
                 </div>
               </div>
 
-              {/* Messages — LINE-style chat bubbles */}
-              <div ref={messagesScrollRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-2" style={{ backgroundColor: '#7494C0' }}>
+              {/* Messages — LINE-style chat bubbles。
+                  relative なラッパで包んでいるのは「新着メッセージ ↓」を
+                  一覧の上に浮かせるため (スクロール領域自体は従来どおり) */}
+              <div className="relative flex-1 min-h-0 flex flex-col">
+              <div
+                ref={messagesScrollRef}
+                onScroll={handleMessagesScroll}
+                className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-2"
+                style={{ backgroundColor: '#7494C0' }}
+              >
                 {(!chatDetail.messages || chatDetail.messages.length === 0) ? (
                   <div className="text-center py-8">
                     <p className="text-white/60 text-sm">メッセージはまだありません。</p>
@@ -1131,9 +1520,76 @@ export default function ChatsPage() {
                       }
                     } else if (msg.messageType === 'sticker') {
                       bubbleContent = <StickerMessageImage content={msg.content} />
+                    } else if (isMediaMessageType(msg.messageType)) {
+                      // 動画 / 音声 / ファイル。要素の位置と型がポーリング前後で
+                      // 変わらないので、15 秒ごとの再描画でも <video> の DOM は
+                      // 再利用され、再生中の動画が止まったり頭出しに戻ったりしない
+                      // (key は上位の msg.id 固定 = content を key にしていない)
+                      bubbleContent = (
+                        <MediaMessageContent
+                          messageType={msg.messageType}
+                          content={msg.content}
+                          isOutgoing={isOutgoing}
+                        />
+                      )
                     } else {
                       bubbleContent = <span>{msg.content}</span>
                     }
+
+                    // --- 引用リプライ ---
+                    // 引用元の抜粋。配列に居ない (履歴 1000 件の打ち切り) 場合は
+                    // resolveQuoteExcerpt がフォールバック文言を返すので落ちない。
+                    const quotedExcerpt = msg.quotedMessageId
+                      ? resolveQuoteExcerpt(allMsgs, msg.quotedMessageId)
+                      : null
+                    const quotedBlock = quotedExcerpt ? (
+                      <div
+                        className={`mb-1.5 rounded bg-black/10 border-l-2 p-2 text-xs leading-snug break-words ${
+                          isBareContent
+                            ? 'border-gray-300 text-gray-500'
+                            : isOutgoing
+                              ? 'border-white/60 text-white/80'
+                              : 'border-gray-300 text-gray-500'
+                        }`}
+                      >
+                        {quotedExcerpt}
+                      </div>
+                    ) : null
+
+                    // 引用ボタン。quotable なメッセージにだけ出す (incoming / outgoing 両方)。
+                    // デスクトップ (lg+) はホバー/フォーカスで出現、それ未満 (タッチ) は
+                    // 常時表示 — ホバーだけに依存すると触れない端末が出るため。
+                    // 位置はバブルの内側 (画面中央側)、背景はどちらの向きでもチャット背景
+                    // (青) の上なので白チップで統一できる。
+                    const isQuoting = quotedMessageId === msg.id
+                    const quoteBlockedByImage = Boolean(pendingImage)
+                    const quoteButton = canQuoteMessage(msg) ? (
+                      <Button
+                        type="button"
+                        size="xs"
+                        // primary (= LINE グリーン) は outgoing バブルの色と同じで、
+                        // 隣に並ぶと 1 つの緑の塊に見える。引用中は白地 + 緑文字/枠にして
+                        // どちらの向きのバブルの横でも「押されている」ことが分かるようにする。
+                        variant="ghost"
+                        onClick={() => handleStartQuote(msg.id)}
+                        disabled={quoteBlockedByImage}
+                        title={
+                          quoteBlockedByImage
+                            ? '画像を添付中は引用できません (画像を外すと引用できます)'
+                            : 'このメッセージを引用して返信'
+                        }
+                        aria-label="このメッセージを引用して返信"
+                        aria-pressed={isQuoting}
+                        className={`flex-shrink-0 ${
+                          isQuoting
+                            // 引用中はボタン自体が状態表示なので常に出しっぱなしにする
+                            ? 'bg-white text-green-700 ring-1 ring-green-500'
+                            : 'bg-white/85 text-gray-600 hover:bg-white lg:opacity-0 lg:group-hover:opacity-100 lg:group-focus-within:opacity-100'
+                        }`}
+                      >
+                        {isQuoting ? '引用中' : '引用'}
+                      </Button>
+                    ) : null
 
                     return (
                       <div key={msg.id}>
@@ -1145,7 +1601,7 @@ export default function ChatsPage() {
                           </div>
                         )}
                         <div
-                          className={`flex items-end gap-2 ${isOutgoing ? 'justify-end' : 'justify-start'}`}
+                          className={`group flex items-end gap-2 ${isOutgoing ? 'justify-end' : 'justify-start'}`}
                         >
                           {/* 相手のアイコン（incoming のみ） */}
                           {!isOutgoing && (
@@ -1160,24 +1616,45 @@ export default function ChatsPage() {
                               親の幅が確定していないとパーセントを解決できず
                               min-content（1 文字幅）まで潰れて縦一列に改行される */}
                           <div className={`flex flex-col w-full min-w-0 ${isOutgoing ? 'items-end' : 'items-start'}`}>
-                            {/* メッセージバブル。flex / sticker はバブル chrome なしで直接置く */}
-                            {isBareContent ? (
-                              <div className="max-w-[92%] lg:max-w-[80%] min-w-0">
-                                {bubbleContent}
-                              </div>
-                            ) : (
-                              <div
-                                className={`max-w-[75%] lg:max-w-[60%] px-3 py-2 text-sm break-words whitespace-pre-wrap ${
-                                  isOutgoing
-                                    ? 'rounded-tl-2xl rounded-tr-md rounded-bl-2xl rounded-br-2xl bg-kumo-brand text-kumo-inverse'
-                                    : 'rounded-tl-md rounded-tr-2xl rounded-bl-2xl rounded-br-2xl bg-white text-gray-900'
-                                }`}
-                              >
-                                {bubbleContent}
-                              </div>
-                            )}
-                            {/* 時刻 */}
+                            {/* メッセージバブル + 引用ボタン。
+                                バブルの max-w は % 指定なので、この行は w-full を保つこと
+                                (幅が確定しないとバブルが min-content まで潰れる)。
+                                引用ボタンはバブルの内側 (画面中央側)・下端揃え。
+                                items-end なのは、outgoing の長文バブルでも引用ボタンが
+                                時刻表示の近くに留まり、宙に浮かないようにするため。 */}
+                            <div
+                              className={`flex w-full min-w-0 items-end gap-1 ${
+                                isOutgoing ? 'justify-end' : 'justify-start'
+                              }`}
+                            >
+                              {isOutgoing && quoteButton}
+                              {/* flex / sticker はバブル chrome なしで直接置く */}
+                              {isBareContent ? (
+                                <div className="max-w-[92%] lg:max-w-[80%] min-w-0">
+                                  {quotedBlock}
+                                  {bubbleContent}
+                                </div>
+                              ) : (
+                                <div
+                                  className={`max-w-[75%] lg:max-w-[60%] px-3 py-2 text-sm break-words whitespace-pre-wrap ${
+                                    isOutgoing
+                                      ? 'rounded-tl-2xl rounded-tr-md rounded-bl-2xl rounded-br-2xl bg-kumo-brand text-kumo-inverse'
+                                      : 'rounded-tl-md rounded-tr-2xl rounded-bl-2xl rounded-br-2xl bg-white text-gray-900'
+                                  }`}
+                                >
+                                  {quotedBlock}
+                                  {bubbleContent}
+                                </div>
+                              )}
+                              {!isOutgoing && quoteButton}
+                            </div>
+                            {/* 時刻 + 送信者。
+                                sentByStaffName は「誰が返信したか」— 複数人で
+                                手動返信を回すとき、後から追えるようにする。
+                                null は異常ではなく普通に起きる (自動配信や
+                                /line-api 経由の送信) ので、そのときは何も出さない。 */}
                             <span className="text-xs text-white/50 mt-0.5 px-1">
+                              {isOutgoing && msg.sentByStaffName ? `${msg.sentByStaffName} · ` : ''}
                               {new Date(msg.createdAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
                             </span>
                           </div>
@@ -1186,6 +1663,18 @@ export default function ChatsPage() {
                     )
                   })
                 )}
+              </div>
+              {/* 過去を遡って読んでいる最中に新着が届いたときだけ出す控えめな導線。
+                  スクロール位置は勝手に動かさず、押されたときだけ最下部へ送る */}
+              {hasUnseenMessages && (
+                <button
+                  type="button"
+                  onClick={scrollMessagesToBottom}
+                  className="self-center my-2 px-3 py-1.5 rounded-full bg-white/95 text-gray-700 text-xs shadow-md hover:bg-white"
+                >
+                  新着メッセージ ↓
+                </button>
+              )}
               </div>
 
               {/* Notes — PC(xl+)は右サイドバーに常設。狭い画面のみトグル表示 */}
@@ -1260,6 +1749,11 @@ export default function ChatsPage() {
                     />
                   </div>
                 )}
+                <div role="status" className="mb-2 rounded-lg bg-gray-100 px-3 py-2 text-sm text-gray-700">
+                  {!lease ? '対応状況を確認中です。接続が戻るまで送信できません。' : lease.owned
+                    ? (lease.expiresAt ? 'あなたが対応中です。他の担当者からの返信を防止しています。' : '手動返信')
+                    : `${lease.staffName}が対応中です。閲覧と下書きはできます。`}
+                </div>
                 {/* 標準的なチャットコンポーザー (Slack / ChatGPT 型):
                     1枚の枠の中に「上: textarea 全幅 / 下: ツールバー行」。
                     - textarea が幅いっぱい = クリックターゲット最大
@@ -1273,6 +1767,32 @@ export default function ChatsPage() {
                     textareaRef.current?.focus()
                   }}
                 >
+                  {/* 引用中プレビュー。入力欄の上に出して × で解除できる。
+                      textarea の自動リサイズは textarea 自身の scrollHeight でしか
+                      計算していないので、この行を足しても高さ計算には影響しない。 */}
+                  {quotedMessageId && (
+                    <div className="flex items-start gap-2 border-b border-gray-200 px-3 pt-2 pb-2">
+                      <div className="min-w-0 flex-1 border-l-2 border-green-500 pl-2">
+                        <p className="text-[11px] text-gray-400">引用中</p>
+                        <p className="truncate text-xs text-gray-600">
+                          {resolveQuoteExcerpt(chatDetail.messages, quotedMessageId)}
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        size="xs"
+                        shape="square"
+                        variant="ghost"
+                        onClick={() => setQuotedMessageId(null)}
+                        title="引用を解除"
+                        aria-label="引用を解除"
+                      >
+                        <svg className="w-4 h-4 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </Button>
+                    </div>
+                  )}
                   <textarea
                     ref={textareaRef}
                     rows={2}
@@ -1305,7 +1825,10 @@ export default function ChatsPage() {
                       shape="square"
                       variant={showImagePicker || pendingImage ? 'primary' : 'ghost'}
                       onClick={() => setShowImagePicker((v) => !v)}
-                      title="画像を添付"
+                      // 引用と画像は排他 (サーバーが text 以外の引用を 400 で弾く)。
+                      // 引用を勝手に捨てるのではなく、画像側を止めて理由を出す。
+                      disabled={Boolean(quotedMessageId)}
+                      title={quotedMessageId ? '引用中は画像を送信できません (引用を解除してください)' : '画像を添付'}
                       aria-label="画像を添付"
                     >
                       <svg className="w-5 h-5 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1336,7 +1859,7 @@ export default function ChatsPage() {
                       variant="primary"
                       loading={sending}
                       onClick={handleSendMessage}
-                      disabled={sending || (!messageContent.trim() && !pendingImage)}
+                      disabled={!lease?.owned || sending || (!messageContent.trim() && !pendingImage)}
                     >
                       送信
                     </Button>

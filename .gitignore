@@ -29,3 +29,11 @@ apps/worker/dist/
 
 # Claude Code local dev-server config (machine-local paths)
 .claude/launch.json
+
+# ローカル開発用に生成するテストメディア (scripts/dev/make-fixtures.mjs の出力)。
+# 生成物のバイナリなのでコミットしない — スクリプトを実行すれば再生成できる。
+scripts/dev/fixtures/
+.gstack/
+
+# Isolated local QA builds
+.next-manual-qa/

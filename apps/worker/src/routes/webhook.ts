@@ -159,6 +159,20 @@ webhook.post('/webhook', async (c) => {
     return c.json({ status: 'ok' }, 200);
   }
 
+  if (c.env.MANUAL_REPLY_ONLY === 'true') {
+    if (!c.env.MANUAL_INBOX) return c.json({ status: 'queue_unavailable' }, 503);
+    // Await durable acceptance before acknowledging LINE. If a later chunk fails,
+    // LINE redelivery is safe because the consumer deduplicates message IDs.
+    for (let offset = 0; offset < body.events.length; offset += 100) {
+      await c.env.MANUAL_INBOX.sendBatch(body.events.slice(offset, offset + 100).map(event => ({
+        body: { event, accountId: matchedAccountId,
+          workerUrl: c.env.WORKER_URL || new URL(c.req.url).origin },
+        contentType: 'json' as const,
+      })));
+    }
+    return c.json({ status: 'ok' }, 200);
+  }
+
   const lineClient = new LineClient(channelAccessToken);
 
   // 非同期処理 — LINE は ~1s 以内のレスポンスを要求
@@ -447,6 +461,8 @@ async function handleEvent(
       id: string;
       type: string;
       fileName?: string;
+      fileSize?: number;
+      duration?: number;
       title?: string;
       packageId?: string | number;
       package_id?: string | number;
@@ -465,7 +481,7 @@ async function handleEvent(
     };
     const content = labels[msg.type] ?? `[${msg.type}]`;
 
-    // image の場合は LINE Content API でバイナリを取得 → R2 → JSON URL に置換。
+    // image / video / audio / file は LINE Content API でバイナリを取得 → R2 → JSON URL に置換。
     // 失敗時は labels[msg.type] のラベル文字列のまま (フォールバック)。
     let finalContent = content;
     if (msg.type === 'sticker') {
@@ -488,14 +504,42 @@ async function handleEvent(
         finalContent = JSON.stringify(refs);
       }
     }
+    // video / audio / file も同じ流儀で R2 に保存し、content を JSON に置換する。
+    // 保存は ReadableStream のままストリーミングで行い、サイズ上限を超えるものや
+    // 取得失敗はラベル文字列のまま (fetchAndStoreIncomingMedia が null を返す)。
+    // ここは try で囲って、万一の例外で webhook 全体 (=inbox 記録) を壊さない。
+    if ((msg.type === 'video' || msg.type === 'audio' || msg.type === 'file') && r2 && workerUrl) {
+      try {
+        const { fetchAndStoreIncomingMedia } = await import('../services/incoming-media.js');
+        const media = await fetchAndStoreIncomingMedia({
+          r2,
+          workerUrl,
+          channelAccessToken: lineAccessToken,
+          accountId: lineAccountId ?? 'unknown',
+          messageId: msg.id,
+          kind: msg.type,
+          duration: msg.duration,
+          fileName: msg.fileName,
+          fileSize: msg.fileSize,
+        });
+        if (media) {
+          finalContent = JSON.stringify(media);
+        }
+      } catch (err) {
+        console.error('[webhook] incoming media store failed', { err, messageType: msg.type });
+      }
+    }
 
     const logId = crypto.randomUUID();
+    // quoteToken は sticker / image / video 等にも付く。LINE SDK の型には無いので安全に取り出す。
+    // 保存しておけば有効期限が無いため、後から管理画面の引用リプライで使える。
+    const quoteToken = (event.message as { quoteToken?: string }).quoteToken ?? null;
     await db
       .prepare(
-        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-         VALUES (?, ?, 'incoming', ?, ?, NULL, NULL, 'user', ?)`,
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, quote_token, created_at)
+         VALUES (?, ?, 'incoming', ?, ?, NULL, NULL, 'user', ?, ?)`,
       )
-      .bind(logId, friend.id, msg.type, finalContent, jstNow())
+      .bind(logId, friend.id, msg.type, finalContent, quoteToken, jstNow())
       .run();
     await awardActivityMileage(db, {
       eventType: 'message_received',
@@ -526,12 +570,15 @@ async function handleEvent(
     const logId = crypto.randomUUID();
 
     // 受信メッセージをログに記録
+    // quoteToken は LINE SDK の型に無いので安全に取り出す (無ければ NULL)。
+    // 有効期限が無いので保存しておけば、後から管理画面の引用リプライで使える。
+    const quoteToken = (event.message as { quoteToken?: string }).quoteToken ?? null;
     await db
       .prepare(
-        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, created_at)
-         VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'user', ?)`,
+        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, quote_token, created_at)
+         VALUES (?, ?, 'incoming', 'text', ?, NULL, NULL, 'user', ?, ?)`,
       )
-      .bind(logId, friend.id, incomingText, now)
+      .bind(logId, friend.id, incomingText, quoteToken, now)
       .run();
 
     await awardActivityMileage(db, {

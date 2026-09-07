@@ -156,6 +156,8 @@ export type FlexContainer = object;
 export interface TextMessage {
   type: 'text';
   text: string;
+  /** 引用リプライ用トークン。受信メッセージの quoteToken をそのまま渡す (省略時は通常送信) */
+  quoteToken?: string;
 }
 
 export interface ImageMessage {
@@ -267,6 +269,21 @@ export interface RichMenuObject {
 }
 
 // ─── Request types ────────────────────────────────────────────────────────────
+
+/**
+ * push / reply のレスポンスに含まれる送信済みメッセージ。
+ * quoteToken は「この送信メッセージを後から引用する」ためのトークンで、
+ * text / sticker / image / video を送ったときに返る (有効期限なし)。
+ */
+export interface SentMessage {
+  id: string;
+  quoteToken?: string;
+}
+
+/** POST /v2/bot/message/push のレスポンス。LINE 側の仕様変更に備え全て optional */
+export interface PushMessageResponse {
+  sentMessages?: SentMessage[];
+}
 
 export interface PushMessageRequest {
   to: string;

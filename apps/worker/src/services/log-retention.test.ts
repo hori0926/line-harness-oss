@@ -64,7 +64,8 @@ const row = (id: string, createdAt: string) => ({
   id, friend_id: 'f1', direction: 'outgoing', message_type: 'text',
   content: '{"text":"hi"}', broadcast_id: null, scenario_step_id: null,
   template_id_at_send: null, delivery_type: 'push', source: 'broadcast',
-  line_account_id: null, created_at: createdAt,
+  line_account_id: null, quote_token: 'quote-token-1', quoted_message_id: 'm0',
+  sent_by_staff_id: 'staff-1', sent_by_staff_name: '担当者', created_at: createdAt,
 });
 
 describe('retentionCutoff', () => {
@@ -97,6 +98,10 @@ describe('runLogRetention', () => {
     expect([...store.keys()]).toEqual([key]);
     // NDJSON: one JSON object per line, round-trips to the selected rows
     expect(store.get(key)!.trimEnd().split('\n').map((l) => JSON.parse(l))).toEqual(rows);
+    // 引用関係と送信者スナップショットも、D1 から削除する前に必ず保存する。
+    const select = executed.find((e) => e.sql.includes('SELECT id, friend_id'));
+    expect(select?.sql).toContain('quote_token, quoted_message_id');
+    expect(select?.sql).toContain('sent_by_staff_id, sent_by_staff_name');
     // SELECT uses the cutoff + limit; DELETE binds exactly the archived ids
     const del = executed.find((e) => e.sql.includes('DELETE FROM messages_log'));
     expect(del).toBeDefined();

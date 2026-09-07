@@ -482,3 +482,30 @@ describe('POST /webhook — first-contact existing friends', () => {
     expect(getMessageTemplateById).not.toHaveBeenCalled();
   });
 });
+
+
+describe('manual inbox durable acceptance', () => {
+  test('does not acknowledge until queue storage succeeds, and never runs automations', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getLineAccounts).mockResolvedValue([]);
+    let accept!: () => void;
+    const sendBatch = vi.fn(() => new Promise<void>(resolve => { accept = resolve; }));
+    const event = { type: 'message', source: { type: 'user', userId: 'Utest' }, timestamp: Date.now(), message: { type: 'text', id: 'm1', text: 'hello' } };
+    let responded = false;
+    const request = Promise.resolve(setupApp().request('/webhook', {
+      method: 'POST', headers: { 'X-Line-Signature': 'A'.repeat(43) + '=' }, body: JSON.stringify({events:[event]}),
+    }, {...baseEnv, MANUAL_REPLY_ONLY: 'true', MANUAL_INBOX: {sendBatch}}, baseExecutionCtx)).then(r => { responded = true; return r; });
+    await vi.waitFor(() => expect(sendBatch).toHaveBeenCalledOnce());
+    expect(responded).toBe(false);
+    expect(JSON.stringify(sendBatch.mock.calls)).not.toContain('env-default-token');
+    accept();
+    expect((await request).status).toBe(200);
+    expect(fireEvent).not.toHaveBeenCalled();
+  });
+  test('returns failure if durable queue is not configured', async () => {
+    vi.mocked(verifySignature).mockResolvedValue(true);
+    vi.mocked(getLineAccounts).mockResolvedValue([]);
+    const res = await setupApp().request('/webhook', { method:'POST', headers:{'X-Line-Signature':'A'.repeat(43)+'='}, body:'{"events":[]}' }, {...baseEnv,MANUAL_REPLY_ONLY:'true'},baseExecutionCtx);
+    expect(res.status).toBe(503);
+  });
+});

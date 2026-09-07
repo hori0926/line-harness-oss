@@ -11,7 +11,7 @@ Cloudflare 무료 플랜에서 동작. **서버 비용 0원**. Claude Code 에�
 
 [![클릭하여 YouTube 재생 — L Harness 도입 가이드](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**현재 버전**: v0.13.2 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
+**현재 버전**: v0.24.0 ・ MIT License ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
@@ -74,7 +74,7 @@ CLI 가 다음을 모두 처리합니다:
 - **친구 관리** — Webhook 자동 등록, 프로필 조회, 커스텀 메타데이터
 - **태그** — 발송 조건 및 시나리오 트리거
 - **리드 스코어링** — 행동 기반 자동 점수 계산
-- **상담원 채팅** — 관리자 페이지에서 직접 1:1 응답
+- **상담원 채팅** — 관리자 페이지에서 인용 답장, 수신 동영상·음성·파일 재생/다운로드, 증분 자동 새로고침, 발신 담당자 표시를 지원하는 1:1 응답
 - **대화 인박스** — 미응답 대화를 방치 시간 순으로 정렬 (자동 발송 제외 판정)
 - **친구 중복 검출** — `picture_url` 중간 토큰으로 여러 계정 간 동일 사용자 자동 태깅
 

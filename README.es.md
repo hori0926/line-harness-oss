@@ -11,7 +11,7 @@ Funciona sobre el plan gratuito de Cloudflare. **Costo de servidor: $0/mes**. Op
 
 [![Haz clic para reproducir en YouTube — Guía de configuración de L Harness](https://img.youtube.com/vi/DiRuGaeq1sM/maxresdefault.jpg)](https://youtu.be/DiRuGaeq1sM)
 
-**Versión actual**: v0.13.2 ・ Licencia MIT ・ TypeScript / Cloudflare Workers + D1
+**Versión actual**: v0.24.0 ・ Licencia MIT ・ TypeScript / Cloudflare Workers + D1
 
 ---
 
@@ -74,7 +74,7 @@ Tarda unos 5 minutos. Al finalizar, el panel en `https://<your-name>-admin.pages
 - **Gestión de contactos** — registro automático por webhook, obtención de perfil, metadata personalizada
 - **Etiquetas** — condiciones de envío y triggers de escenario
 - **Lead scoring** — cálculo automático basado en comportamiento
-- **Chat de operador** — respuesta directa 1:1 desde el panel
+- **Chat de operador** — respuestas directas 1:1 con citas, reproducción y descarga de video/audio/archivos recibidos, actualización incremental y atribución del empleado remitente
 - **Inbox de conversaciones** — lista las conversaciones sin responder ordenadas por tiempo de inactividad (los envíos automáticos se excluyen)
 - **Deduplicación de contactos** — etiqueta automáticamente al mismo usuario físico en varias cuentas vía token de `picture_url`
 
