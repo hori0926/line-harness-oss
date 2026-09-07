@@ -6,6 +6,10 @@ L Harnessのチャット機能は、オペレーター（人間）が友だち�
 
 L社の「個別トーク」「自動応答」に相当する機能。
 
+このforkの `MANUAL_REPLY_ONLY=true` では署名検証後にQueueへの保存を待ち、
+consumerが会話・添付を保存する。以下の自動応答・イベントバス処理とcron配信は実行しない。
+[手動運用の接続・受入手順](../operations/manual-line-migration.md)も参照。
+
 ## アーキテクチャ
 
 ```
@@ -85,18 +89,22 @@ CREATE TABLE messages_log (
   quoted_message_id TEXT REFERENCES messages_log (id) ON DELETE SET NULL,
   sent_by_staff_id TEXT,         -- 手動送信した staff_members.id
   sent_by_staff_name TEXT,       -- 送信時点のスタッフ名スナップショット
+  content_updated_at TEXT,       -- 添付の取得・失敗・復旧時の変更日時
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX idx_messages_log_friend_id ON messages_log (friend_id);
 CREATE INDEX idx_messages_log_created_at ON messages_log (created_at);
 CREATE INDEX idx_messages_log_friend_created ON messages_log (friend_id, created_at, id);
+CREATE INDEX idx_messages_friend_content_updated ON messages_log (friend_id, content_updated_at);
 ```
 
 受信した動画・音声・ファイルは LINE Content API から取得して R2 に保存し、
-`content` に表示用 URL、ファイル名、サイズなどの JSON を記録する。取得失敗、
-サイズ上限超過、R2 保存失敗の場合でも webhook 自体は成功させ、`[動画]`、
-`[音声]`、`[ファイル]` のラベル表示へフォールバックする。
+`content` に表示用 URL、ファイル名、サイズなどの JSON を記録する。
+手動運用モードではQueueへの保存後にWebhookを成功させ、取得待ちの行を表示する。
+取得失敗は再試行し、上限到達時は取得失敗を表示してジョブをDLQへ残す。
+復旧時は元の受信日時を保持し、`content_updated_at` を更新する。
+従来モードでは取得失敗時にラベル表示へフォールバックする。
 
 ## チャットステータスライフサイクル
 
@@ -365,6 +373,9 @@ curl -X GET "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID?
 境界時刻を含む最大200件を返し、`isDelta` が `true` になる。同じミリ秒の後着を
 取りこぼさないため境界行が再度含まれることがあるので、クライアントは `id` で重複除去する。
 `quoteToken` の実値は API レスポンスへ出さず、引用できるかどうかだけを `quotable` で返す。
+添付の変更も `contentUpdatedAt` として返す。次の `since` には各行の
+`contentUpdatedAt ?? createdAt` の最大値を使い、表示順には `createdAt` を使う。
+差分は変更日時順で返るため、古い添付の復旧も `id` で置き換える。
 
 #### チャット作成
 
@@ -407,6 +418,14 @@ curl -X PUT "https://your-worker.your-subdomain.workers.dev/api/chats/CHAT_UUID"
 ```
 
 #### オペレーターからメッセージ送信
+
+以下は従来モードの例。`MANUAL_REPLY_ONLY=true` では担当者ごとの認証と、
+本文にUUID v4の `requestId` が必須。同一操作の再試行には同じIDと本文を使う。
+送信時に90秒の担当ロックを取得・更新し、別担当者の有効なロックがあれば409を返す。
+管理画面は `POST /api/chats/:id/lease` を20秒ごとに呼び、
+`{ owned, staffName, expiresAt }` によって送信可否を表示する。
+`GET /api/chats/activity` は一覧の更新通知用に `{ version }` を返す
+（どちらも通常の `{ success, data }` 形式）。
 
 ```bash
 # テキストメッセージ送信

@@ -2,6 +2,11 @@
 
 L Harness は、fork した repo を自分の本番環境として育てる運用を推奨します。
 
+このforkのWorker workflowは `MANUAL_REPLY_ONLY=true` の手動返信構成をデプロイします。
+初回導入は[PC手動返信の移行手順](operations/manual-line-migration.md)に従い、
+専用D1・R2・Queue・DLQを作成してください。以下のセットアップCLIは上流の汎用手順で、
+このfork固有のキューと手動運用設定は別途必要です。
+
 ## 目指す形
 
 ```text
@@ -66,18 +71,20 @@ Variables:
 | 名前 | 用途 |
 | --- | --- |
 | `LINE_HARNESS_CLOUDFLARE_DEPLOY` | `true` のときだけ fork 用 deploy workflow を実行する |
-| `WORKER_NAME` | deploy する Worker 名。未設定時は `your-worker-name` |
+| `WORKER_NAME` | deploy する Worker 名。必須 |
+| `R2_BUCKET_NAME` | 専用の受信添付バケット名。必須 |
+| `INBOX_QUEUE_NAME` | 手動受信キュー名。必須 |
+| `INBOX_DLQ_NAME` | 再試行上限に達したジョブの保存キュー名。必須 |
 | `PAGES_PROJECT_NAME` | deploy する Pages project 名。未設定時は `your-admin-name` |
 | `VITE_LIFF_ID` | LIFF ID |
 | `VITE_BOT_BASIC_ID` | LINE bot basic ID |
 | `VITE_CALENDAR_CONNECTION_ID` | Google Calendar 連携を使う場合だけ設定 |
-| `ADMIN_ORIGIN` | Pages と Worker が別 origin の場合の管理画面 URL |
-| `ADMIN_ALLOW_CROSS_SITE` | 別 origin 構成では `true`。cookie を `SameSite=None` にする |
-| `WORKER_URL` | Worker の公開 URL。設定時は Worker の deploy config に反映 |
+| `ADMIN_ORIGIN` | 管理画面 URL。必須 |
+| `WORKER_URL` | Worker の公開 URL。必須 |
 
 `LINE_HARNESS_CLOUDFLARE_DEPLOY=true` がない場合、fork では workflow 自体は
 起動しても deploy job がスキップされます。Pages と Worker が別 origin の
-通常構成では `ADMIN_ORIGIN` と `ADMIN_ALLOW_CROSS_SITE=true` も設定してください。
+通常構成向けに、workflowが `ADMIN_ALLOW_CROSS_SITE=true` を設定します。
 cookie/CORS の構成は [Admin Authentication](ADMIN-AUTH.md) を参照してください。
 
 Worker secrets は `wrangler secret put` で Cloudflare 側に設定します。

@@ -209,3 +209,4 @@ Issue / PR 歓迎。OSS リポへの PR は `Shudesu/line-harness-oss` (この�
 
 このforkのデプロイは、まずAIなしの手動返信用として構成します。
 [移行手順・必要な資格情報・公式管理画面との違い](docs/operations/manual-line-migration.md)を確認してください。
+[ローカル検証記録と実環境の未完了項目](docs/operations/manual-line-validation.md)も参照できます。
