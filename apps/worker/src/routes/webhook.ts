@@ -159,6 +159,20 @@ webhook.post('/webhook', async (c) => {
     return c.json({ status: 'ok' }, 200);
   }
 
+  if (c.env.MANUAL_REPLY_ONLY === 'true') {
+    if (!c.env.MANUAL_INBOX) return c.json({ status: 'queue_unavailable' }, 503);
+    // Await durable acceptance before acknowledging LINE. If a later chunk fails,
+    // LINE redelivery is safe because the consumer deduplicates message IDs.
+    for (let offset = 0; offset < body.events.length; offset += 100) {
+      await c.env.MANUAL_INBOX.sendBatch(body.events.slice(offset, offset + 100).map(event => ({
+        body: { event, accountId: matchedAccountId,
+          workerUrl: c.env.WORKER_URL || new URL(c.req.url).origin },
+        contentType: 'json' as const,
+      })));
+    }
+    return c.json({ status: 'ok' }, 200);
+  }
+
   const lineClient = new LineClient(channelAccessToken);
 
   // 非同期処理 — LINE は ~1s 以内のレスポンスを要求

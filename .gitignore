@@ -34,3 +34,6 @@ apps/worker/dist/
 # 生成物のバイナリなのでコミットしない — スクリプトを実行すれば再生成できる。
 scripts/dev/fixtures/
 .gstack/
+
+# Isolated local QA builds
+.next-manual-qa/

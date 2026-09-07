@@ -336,3 +336,13 @@ describe('applyChatListRow', () => {
     expect(applyChatListRow(undefined, 'a', patch)).toEqual([])
   })
 })
+
+
+test('recovered media advances the polling cursor without changing conversation order', () => {
+  const old = { id:'media',direction:'incoming' as const,messageType:'video',content:'[video: 取得失敗]',createdAt:'2026-09-07T10:00:00Z' };
+  const newer = { ...old,id:'text',messageType:'text',content:'続き',createdAt:'2026-09-07T10:01:00Z' };
+  const recovered = { ...old,content:'{"type":"video","originalContentUrl":"https://example.test/video"}',contentUpdatedAt:'2026-09-07T10:02:00Z' };
+  const merged = mergeMessages([old,newer],[recovered],{isDelta:true});
+  expect(merged.map(m=>m.id)).toEqual(['media','text']);
+  expect(sinceForPoll(merged)).toBe(recovered.contentUpdatedAt);
+});

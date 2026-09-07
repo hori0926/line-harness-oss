@@ -93,7 +93,7 @@ function fakeDb(seed: LogRow[] = []) {
         },
         async run() {
           queries.push({ sql, params: statement.params });
-          if (sql.includes('INSERT INTO messages_log')) {
+          if (sql.includes('INTO messages_log')) {
             // 送信ログの bind 順: (id, friend_id, message_type, content,
             //   quote_token, quoted_message_id, sent_by_staff_id, sent_by_staff_name, created_at)
             const [id, friendId, , content, quoteToken, quotedMessageId, staffId, staffName, createdAt] =
@@ -221,7 +221,7 @@ async function getBody(res: Response): Promise<{ raw: string; data: ChatDetail }
 }
 
 function outgoingInsert(queries: Query[]) {
-  return queries.find((q) => q.sql.includes('INSERT INTO messages_log'));
+  return queries.find((q) => q.sql.includes('INTO messages_log'));
 }
 
 function messagesSelect(queries: Query[]) {
@@ -329,9 +329,9 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
 
     const select = messagesSelect(queries);
     expect(select?.sql).toContain('created_at >= ?');
-    expect(select?.sql).toContain('ORDER BY created_at ASC, id ASC');
+    expect(select?.sql).toContain('ORDER BY COALESCE(content_updated_at, created_at) ASC, id ASC');
     expect(select?.sql).toContain('LIMIT 200');
-    expect(select?.params).toEqual(['friend-1', '2026-09-03T11:00:00.000+09:00']);
+    expect(select?.params).toEqual(['friend-1', '2026-09-03T11:00:00.000+09:00', '2026-09-03T11:00:00.000+09:00']);
   });
 
   test('UTC (Z) 表記の since でも JST に正規化して比較する', async () => {
@@ -345,6 +345,7 @@ describe('GET /api/chats/:id — 差分取得 (?since=)', () => {
     expect(data.messages.map((m) => m.id)).toEqual(['msg-boundary', 'msg-new']);
     expect(messagesSelect(queries)?.params).toEqual([
       'friend-1',
+      '2026-09-03T11:00:00.000+09:00',
       '2026-09-03T11:00:00.000+09:00',
     ]);
   });

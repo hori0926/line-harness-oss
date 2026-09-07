@@ -115,3 +115,28 @@ class_name = "TenantScheduler"
 
 [env.production.triggers]
 crons = ["* * * * *", "0 */6 * * *"]
+
+# Manual inbox is durably accepted before the webhook is acknowledged.
+[[queues.producers]]
+binding = "MANUAL_INBOX"
+queue = "line-harness-inbox"
+
+[[queues.consumers]]
+queue = "line-harness-inbox"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 10
+max_concurrency = 1
+dead_letter_queue = "line-harness-inbox-dlq"
+
+[[env.production.queues.producers]]
+binding = "MANUAL_INBOX"
+queue = "line-harness-inbox"
+
+[[env.production.queues.consumers]]
+queue = "line-harness-inbox"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 10
+max_concurrency = 1
+dead_letter_queue = "line-harness-inbox-dlq"

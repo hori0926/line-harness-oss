@@ -83,7 +83,7 @@ function fakeDb(seed: LogRow[] = []) {
         },
         async run() {
           queries.push({ sql, params: statement.params });
-          if (sql.includes('INSERT INTO messages_log')) {
+          if (sql.includes('INTO messages_log')) {
             // 送信ログの bind 順:
             // (id, friend_id, message_type, content, quote_token, quoted_message_id, created_at)
             const [id, friendId, , , quoteToken, quotedMessageId] = statement.params as [
@@ -173,7 +173,7 @@ function lastPushPayload(mock: ReturnType<typeof vi.fn>) {
 }
 
 function outgoingInsert(queries: Query[]) {
-  return queries.find((q) => q.sql.includes('INSERT INTO messages_log'));
+  return queries.find((q) => q.sql.includes('INTO messages_log'));
 }
 
 /** LINE の push レスポンス (成功時は sentMessages が返る) */

@@ -244,6 +244,13 @@ CREATE TABLE IF NOT EXISTS calendar_bookings (
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE IF NOT EXISTS chat_leases (
+  friend_id TEXT PRIMARY KEY REFERENCES friends(id),
+  staff_id TEXT NOT NULL,
+  staff_name TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chats (
   id            TEXT PRIMARY KEY,
   friend_id     TEXT NOT NULL REFERENCES friends (id) ON DELETE CASCADE,
@@ -539,6 +546,15 @@ CREATE TABLE IF NOT EXISTS link_clicks (
   clicked_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS manual_send_requests (
+  request_id TEXT PRIMARY KEY,
+  friend_id TEXT NOT NULL REFERENCES friends(id),
+  staff_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  sent INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS media_inquiries (
   id TEXT PRIMARY KEY,
   inquiry_type TEXT NOT NULL,
@@ -650,7 +666,7 @@ CREATE TABLE IF NOT EXISTS messages_log (
   -- 別に持つ (FK にしない)。自動配信は NULL
   sent_by_staff_name TEXT,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
-);
+, content_updated_at TEXT);
 
 CREATE TABLE IF NOT EXISTS mileage_event_queue (
   engagement_event_id   TEXT PRIMARY KEY REFERENCES engagement_events(id) ON DELETE CASCADE,
@@ -1212,6 +1228,8 @@ CREATE INDEX IF NOT EXISTS idx_chats_operator ON chats (operator_id);
 
 CREATE INDEX IF NOT EXISTS idx_chats_status ON chats (status);
 
+CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at);
+
 CREATE INDEX IF NOT EXISTS idx_conversion_events_affiliate ON conversion_events (affiliate_code);
 
 CREATE INDEX IF NOT EXISTS idx_conversion_events_friend ON conversion_events (friend_id);
@@ -1309,6 +1327,8 @@ CREATE INDEX IF NOT EXISTS idx_meet_consultations_friend ON meet_consultations (
 CREATE INDEX IF NOT EXISTS idx_meet_consultations_start ON meet_consultations (status, starts_at);
 
 CREATE INDEX IF NOT EXISTS idx_menus_account_sort ON menus (line_account_id, sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_messages_friend_content_updated ON messages_log(friend_id, content_updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_messages_log_broadcast_id ON messages_log(broadcast_id);
 

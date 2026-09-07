@@ -58,6 +58,7 @@ interface ChatMessage {
   /** true なら「このメッセージを引用して返信できる」(incoming / outgoing どちらもあり得る) */
   quotable?: boolean
   /** このメッセージが引用した元メッセージの id (同じ messages 配列内に居る想定) */
+  contentUpdatedAt?: string | null
   quotedMessageId?: string | null
   /** 手動送信した担当者の名前。自動配信 (シナリオ / 一斉配信) は null */
   sentByStaffName?: string | null
@@ -456,6 +457,23 @@ export default function ChatsPage() {
   const [hasMoreChats, setHasMoreChats] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState('')
+  const [lease, setLease] = useState<{ owned: boolean; staffName: string; expiresAt: number } | null>(null)
+  useEffect(() => {
+    setLease(null)
+    if (!selectedChatId) return
+    let cancelled = false
+    const refresh = async () => {
+      if (document.visibilityState === 'hidden') { setLease(null); return }
+      try {
+        const res = await api.chats.lease(selectedChatId)
+        if (!cancelled) setLease(res.success ? res.data : null)
+      } catch { if (!cancelled) setLease(null) }
+    }
+    void refresh()
+    const timer = window.setInterval(refresh, 20_000)
+    document.addEventListener('visibilitychange', refresh)
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener('visibilitychange', refresh) }
+  }, [selectedChatId])
   const [messageContent, setMessageContent] = useState('')
   const [pendingImage, setPendingImage] = useState<ImageUploaderValue | null>(null)
   // 引用リプライ: 引用する元メッセージの id。null = 引用なし。
@@ -547,8 +565,10 @@ export default function ChatsPage() {
     return params
   }, [statusFilter, selectedAccountId, unansweredOnly])
 
+  const [listChanged, setListChanged] = useState(false)
   const loadChats = useCallback(async () => {
     setLoading(true)
+    setListChanged(false)
     setError('')
     try {
       const chatRes = await api.chats.list(buildListParams(null))
@@ -762,13 +782,28 @@ export default function ChatsPage() {
     }
   }, [selectedChatId, pollChatDetail])
 
-  // チャット一覧には定期ポーリングを入れない。
-  // 一覧クエリは last_any CTE が messages_log を全走査する構造で、本番実測
-  // 459ms / 165k rows_read (LIMIT 300)。30 秒間隔だとオペレーター 5 人で
-  // 1 日 8 億行に達し、D1 の無料枠 (500 万行/日) を 2 桁超過する。
-  // 代わりに、選択中チャットの差分ポーリングで新着を検知したときに
-  // その 1 行だけをローカルで更新する (上の pollChatDetail 参照)。
-  // 他の会話の新着はサイドバーの未対応バッジ (5 分間隔) に任せる。
+  // Poll an indexed marker, not the expensive full history/list query.
+  useEffect(() => {
+    let version: string | undefined
+    let cancelled = false
+    let busy = false
+    const tick = async () => {
+      if (document.hidden || busy) return
+      busy = true
+      try {
+        const res = await api.chats.activity()
+        if (!cancelled && res.success) {
+          if (version !== undefined && version !== res.data.version) setListChanged(true)
+          version = res.data.version
+        }
+      } catch { /* the normal refresh action reports connection errors */ }
+      finally { busy = false }
+    }
+    void tick()
+    const timer = window.setInterval(tick, 15_000)
+    document.addEventListener('visibilitychange', tick)
+    return () => { cancelled = true; clearInterval(timer); document.removeEventListener('visibilitychange', tick) }
+  }, [])
 
   // 会話を切り替えたら「新着あり」の導線は捨てる (前の会話の状態なので)
   useEffect(() => {
@@ -984,7 +1019,7 @@ export default function ChatsPage() {
   }
 
   const handleSendMessage = async () => {
-    if (!selectedChatId || sending || sendLockRef.current) return
+    if (!selectedChatId || sending || sendLockRef.current || !lease?.owned) return
     if (!messageContent.trim() && !pendingImage) return
     const sendingChatId = selectedChatId  // capture the chat id for this send
     sendLockRef.current = true
@@ -1178,6 +1213,11 @@ export default function ChatsPage() {
     // 使わない — バナーやモバイル URL バーの分ずれてコンポーザーがはみ出すため。
     <div className="flex flex-col flex-1 min-h-0 bg-white">
       {/* Error */}
+      {listChanged && (
+        <button type="button" onClick={() => void loadChats()} className="mb-2 rounded-lg bg-green-100 px-4 py-2 text-sm text-green-900">
+          会話一覧に更新があります。クリックして最新の一覧を表示
+        </button>
+      )}
       {error && (
         <div className="m-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
           {error}
@@ -1504,7 +1544,7 @@ export default function ChatsPage() {
                       : null
                     const quotedBlock = quotedExcerpt ? (
                       <div
-                        className={`mb-1.5 border-l-2 pl-2 text-xs leading-snug break-words ${
+                        className={`mb-1.5 rounded bg-black/10 border-l-2 p-2 text-xs leading-snug break-words ${
                           isBareContent
                             ? 'border-gray-300 text-gray-500'
                             : isOutgoing
@@ -1630,7 +1670,7 @@ export default function ChatsPage() {
                 <button
                   type="button"
                   onClick={scrollMessagesToBottom}
-                  className="absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full bg-white/95 text-gray-700 text-xs shadow-md hover:bg-white"
+                  className="self-center my-2 px-3 py-1.5 rounded-full bg-white/95 text-gray-700 text-xs shadow-md hover:bg-white"
                 >
                   新着メッセージ ↓
                 </button>
@@ -1709,6 +1749,11 @@ export default function ChatsPage() {
                     />
                   </div>
                 )}
+                <div role="status" className="mb-2 rounded-lg bg-gray-100 px-3 py-2 text-sm text-gray-700">
+                  {!lease ? '対応状況を確認中です。接続が戻るまで送信できません。' : lease.owned
+                    ? (lease.expiresAt ? 'あなたが対応中です。他の担当者からの返信を防止しています。' : '手動返信')
+                    : `${lease.staffName}が対応中です。閲覧と下書きはできます。`}
+                </div>
                 {/* 標準的なチャットコンポーザー (Slack / ChatGPT 型):
                     1枚の枠の中に「上: textarea 全幅 / 下: ツールバー行」。
                     - textarea が幅いっぱい = クリックターゲット最大
@@ -1814,7 +1859,7 @@ export default function ChatsPage() {
                       variant="primary"
                       loading={sending}
                       onClick={handleSendMessage}
-                      disabled={sending || (!messageContent.trim() && !pendingImage)}
+                      disabled={!lease?.owned || sending || (!messageContent.trim() && !pendingImage)}
                     >
                       送信
                     </Button>

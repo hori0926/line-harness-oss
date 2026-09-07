@@ -35,6 +35,7 @@ export interface SyncableMessage {
   direction: 'incoming' | 'outgoing'
   messageType: string
   content: string
+  contentUpdatedAt?: string | null
   createdAt: string
   /**
    * 楽観更新でローカルに足しただけで、まだサーバーから返ってきていないメッセージ。
@@ -66,7 +67,8 @@ export function sinceForPoll(messages: readonly SyncableMessage[] | null | undef
   for (const m of messages) {
     if (m.pending) continue
     if (!m.createdAt) continue
-    if (latest === null || timeOf(m.createdAt) > timeOf(latest)) latest = m.createdAt
+    const cursor = m.contentUpdatedAt ?? m.createdAt
+    if (latest === null || timeOf(cursor) > timeOf(latest)) latest = cursor
   }
   return latest
 }

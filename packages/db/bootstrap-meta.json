@@ -80,7 +80,10 @@
     "072_health_logs_composite_index.sql",
     "073_message_quote_tokens.sql",
     "074_message_sender_staff.sql",
-    "075_messages_log_friend_created.sql"
+    "075_messages_log_friend_created.sql",
+    "076_chat_leases.sql",
+    "077_manual_send_requests.sql",
+    "078_message_content_updates.sql"
   ],
-  "migrationCount": 81
+  "migrationCount": 84
 }

@@ -167,64 +167,52 @@ function extFromFileName(fileName: string | undefined): string | null {
   return sanitizeExt(fileName.slice(dot + 1));
 }
 
-/**
- * 上限バイト数を超えたらストリームを error にする TransformStream を挟む。
- *
- * Content-Length による事前判定 (下の storeFromResponse を参照) が第一の防御だが、
- * ヘッダは省略され得るし、値が実体と一致する保証もない。ここで実バイト数を数えて
- * 打ち切ることで、Content-Length の有無に関わらず上限が効く。
- * 途中まで書かれた R2 オブジェクトは呼び出し側が best-effort で delete する。
- */
-function limitStream(body: ReadableStream<Uint8Array>, limit: number, label: string): ReadableStream<Uint8Array> {
+/** Upload fixed-size parts so R2 never receives an unknown-length stream.
+ * At most one 5 MiB part is buffered, independent of the incoming file size. */
+export async function putBoundedMedia(
+  r2: R2Bucket, key: string, body: ReadableStream<Uint8Array>,
+  limit: number, metadata: R2HTTPMetadata, customMetadata?: Record<string, string>,
+): Promise<void> {
+  const partSize = 5 * 1024 * 1024;
+  const reader = body.getReader();
+  let upload: R2MultipartUpload | undefined;
+  const parts: R2UploadedPart[] = [];
+  let buffer = new Uint8Array(partSize);
+  let used = 0;
   let total = 0;
-  const transform = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      total += chunk.byteLength;
-      if (total > limit) {
-        controller.error(new Error(`${label}: size limit exceeded (>${limit} bytes)`));
-        return;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw new Error('incoming-media: size limit exceeded');
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const size = Math.min(partSize - used, value.byteLength - offset);
+        buffer.set(value.subarray(offset, offset + size), used);
+        used += size;
+        offset += size;
+        if (used === partSize) {
+          upload ??= await r2.createMultipartUpload(key, { httpMetadata: metadata, customMetadata });
+          parts.push(await upload.uploadPart(parts.length + 1, buffer));
+          buffer = new Uint8Array(partSize);
+          used = 0;
+        }
       }
-      controller.enqueue(chunk);
-    },
-  });
-  // pipeTo の rejection は put 側の失敗として観測されるので、ここでは
-  // unhandled rejection にならないよう握り潰すだけでよい。
-  void body.pipeTo(transform.writable).catch(() => {});
-  return transform.readable;
-}
-
-/**
- * R2 の put() は「長さが分かっているストリーム」しか受け付けない
- * (workerd: "Provided readable stream must have a known length
- *  (request/response body or readable half of FixedLengthStream)")。
- *
- * fetch のレスポンス body は Content-Length があれば長さ既知だが、上の
- * limitStream() が挟む TransformStream を通した時点でその情報は失われる。
- * そのままだと put が必ず TypeError になり、動画・音声・ファイル・画像の
- * すべてがラベル表示にフォールバックしてしまう (R2 スタブを使う単体テストでは
- * 検出できない)。Content-Length が分かっているときは FixedLengthStream で
- * 長さを再付与して R2 に渡す。
- *
- * Content-Length が無いときは長さを宣言しようがないので、これまで通り
- * 素の TransformStream を返す (上限判定はストリーム側で効いたまま)。
- * FixedLengthStream は Workers ランタイム固有のグローバルなので、Node で走る
- * 単体テストではそのまま素通しになる。
- */
-function withKnownLength(
-  stream: ReadableStream<Uint8Array>,
-  contentLengthHeader: string | null,
-): ReadableStream<Uint8Array> {
-  if (typeof FixedLengthStream === 'undefined') return stream;
-  if (contentLengthHeader === null) return stream;
-  const length = Number(contentLengthHeader);
-  if (!Number.isSafeInteger(length) || length < 0) return stream;
-
-  const fixed = new FixedLengthStream(length);
-  // 宣言した長さと実際のバイト数が食い違うと writable 側が error になり、
-  // put が reject する → 呼び出し元が null を返してラベルにフォールバックする。
-  // (握り潰すのは unhandled rejection を出さないためだけ。)
-  void stream.pipeTo(fixed.writable).catch(() => {});
-  return fixed.readable as ReadableStream<Uint8Array>;
+    }
+    if (!upload) {
+      await r2.put(key, buffer.subarray(0, used), { httpMetadata: metadata, customMetadata });
+    } else {
+      if (used) parts.push(await upload.uploadPart(parts.length + 1, buffer.subarray(0, used)));
+      await upload.complete(parts);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    await upload?.abort().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function fetchLineContent(
@@ -236,6 +224,7 @@ async function fetchLineContent(
   try {
     res = await fetcher(`${lineContentApiMessageBase()}/${opts.messageId}/${path}`, {
       headers: { Authorization: `Bearer ${opts.channelAccessToken}` },
+      signal: AbortSignal.timeout(45_000),
     });
   } catch (err) {
     console.error('incoming-media: fetch failed', { err, path, messageId: opts.messageId, accountId: opts.accountId });
@@ -246,6 +235,7 @@ async function fetchLineContent(
   // 202 の再試行は durable queue 化と合わせて行う (現状はラベルへフォールバック)。
   if (res.status !== 200) {
     console.error('incoming-media: non-200', { status: res.status, path, messageId: opts.messageId, accountId: opts.accountId });
+    await res.body?.cancel().catch(() => {});
     return null;
   }
   return res;
@@ -288,20 +278,11 @@ async function storeFromResponse(
     return null;
   }
 
-  // arrayBuffer() を経由せずストリームのまま R2 に渡す (動画は 200MB あり得るため必須)。
-  const stream = withKnownLength(
-    limitStream(res.body, params.limit, 'incoming-media'),
-    res.headers.get('Content-Length'),
-  );
-
   try {
-    await opts.r2.put(params.key, stream, {
-      httpMetadata: { contentType: params.contentType },
-      // R2 の customMetadata は S3 互換のユーザーメタデータで、値は US-ASCII が前提。
-      // 「見積書.pdf」のような日本語名をそのまま入れると保存/読み出しで壊れ得るので
-      // percent-encode して格納し、配信側 (routes/images.ts) で decode する。
-      ...(params.downloadName ? { customMetadata: { downloadName: encodeURIComponent(params.downloadName) } } : {}),
-    });
+    await putBoundedMedia(opts.r2, params.key, res.body, params.limit,
+      { contentType: params.contentType },
+      params.downloadName ? { downloadName: encodeURIComponent(params.downloadName) } : undefined,
+    );
   } catch (err) {
     console.error('incoming-media: R2 put failed', { err, key: params.key, messageId: opts.messageId, accountId: opts.accountId });
     // 上限超過で打ち切った場合など、途中まで書かれたオブジェクトが残り得るので消す。

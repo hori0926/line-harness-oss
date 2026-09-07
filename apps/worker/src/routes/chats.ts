@@ -1,3 +1,4 @@
+import { claimChatLease } from '../services/chat-lease.js';
 import { Hono } from 'hono';
 import { extractFlexAltText } from '../utils/flex-alt-text.js';
 import {
@@ -416,6 +417,12 @@ chats.get('/api/chats', async (c) => {
   }
 });
 
+// Indexed change marker: polling this avoids repeatedly scanning message history.
+chats.get('/api/chats/activity', async (c) => {
+  const latest = await c.env.DB.prepare('SELECT updated_at FROM chats ORDER BY updated_at DESC LIMIT 1').first<{ updated_at: string }>();
+  return c.json({ success: true, data: { version: latest?.updated_at ?? '' } });
+});
+
 chats.get('/api/chats/:id', async (c) => {
   try {
     const rawId = c.req.param('id');
@@ -475,17 +482,17 @@ chats.get('/api/chats/:id', async (c) => {
     const messages = isDelta
       ? await c.env.DB
           .prepare(
-            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at
+            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at, content_updated_at
              FROM messages_log
              WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
-               AND created_at >= ?
-             ORDER BY created_at ASC, id ASC LIMIT 200`,
+               AND (created_at >= ? OR content_updated_at >= ?)
+             ORDER BY COALESCE(content_updated_at, created_at) ASC, id ASC LIMIT 200`,
           )
-          .bind(resolvedFriendId, since)
+          .bind(resolvedFriendId, since, since)
           .all()
       : await c.env.DB
           .prepare(
-            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at
+            `SELECT id, friend_id, direction, message_type, content, quote_token, quoted_message_id, sent_by_staff_name, created_at, content_updated_at
              FROM messages_log
              WHERE friend_id = ? AND (delivery_type IS NULL OR delivery_type != 'test')
              ORDER BY created_at DESC LIMIT 1000`,
@@ -519,6 +526,7 @@ chats.get('/api/chats/:id', async (c) => {
           direction: m.direction,
           messageType: m.message_type,
           content: m.content,
+          contentUpdatedAt: m.content_updated_at ?? null,
           // quoteToken の実値は返さない (フロントは引用可否しか使わず、
           // 送信時に渡すのは quotedMessageId のみ)。トークンは秘密情報として扱う。
           quotable: Boolean(m.quote_token),
@@ -576,6 +584,16 @@ chats.put('/api/chats/:id', async (c) => {
   }
 });
 
+// Browsing a conversation claims a short lease; other staff can still read it.
+chats.post('/api/chats/:id/lease', async (c) => {
+  if (c.env.MANUAL_REPLY_ONLY !== 'true') return c.json({ success: true, data: { owned: true, staffName: '', expiresAt: 0 } });
+  const staff = c.get('staff');
+  if (!staff) return c.json({ success: false, error: 'ログインが必要です' }, 401);
+  const chat = await resolveOrCreateChat(c.env.DB, c.req.param('id'));
+  if (!chat) return c.json({ success: false, error: 'Chat not found' }, 404);
+  return c.json({ success: true, data: await claimChatLease(c.env.DB, chat.friend_id, staff) });
+});
+
 // オペレーター入力中のローディング表示を開始
 chats.post('/api/chats/:id/loading', async (c) => {
   try {
@@ -620,10 +638,21 @@ chats.post('/api/chats/:id/send', async (c) => {
     const chat = await resolveOrCreateChat(c.env.DB, chatId);
     if (!chat) return c.json({ success: false, error: 'Chat not found' }, 404);
 
-    const body = await c.req.json<{ messageType?: string; content: string; quotedMessageId?: string }>();
+    if (c.env.MANUAL_REPLY_ONLY === 'true') {
+      const staff = c.get('staff');
+      if (!staff) return c.json({ success: false, error: 'ログインが必要です' }, 401);
+      const lease = await claimChatLease(c.env.DB, chat.friend_id, staff);
+      if (!lease.owned) return c.json({ success: false, error: `${lease.staffName}が対応中です。送信していません。` }, 409);
+    }
+
+    const body = await c.req.json<{ messageType?: string; content: string; quotedMessageId?: string; requestId?: string }>();
     if (!body.content) return c.json({ success: false, error: 'content is required' }, 400);
 
     const messageType = body.messageType ?? 'text';
+    if (!['text', 'image', 'flex'].includes(messageType) || typeof body.content !== 'string' || !body.content.trim()) {
+      return c.json({ success: false, error: '対応していない送信形式、または本文が空です' }, 400);
+    }
+
     // 空文字は「引用なし」として扱う (DB に '' を残さない)
     const quotedMessageId = body.quotedMessageId || null;
 
@@ -665,8 +694,38 @@ chats.post('/api/chats/:id/send', async (c) => {
     const { LineClient, extractSentQuoteToken } = await import('@line-crm/line-sdk');
     const lineClient = new LineClient(accessToken);
 
+    const requestId = body.requestId;
+    if (requestId && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      return c.json({ success: false, error: '送信IDが不正です' }, 400);
+    }
+    if (c.env.MANUAL_REPLY_ONLY === 'true' && !requestId) {
+      return c.json({ success: false, error: '画面を更新してから送信してください' }, 400);
+    }
+    if (requestId) {
+      const payload = JSON.stringify({ messageType, content: body.content, quotedMessageId });
+      const staffId = c.get('staff')?.id ?? 'unknown';
+      await c.env.DB.prepare(`INSERT OR IGNORE INTO manual_send_requests (request_id,friend_id,staff_id,payload,created_at)
+        VALUES (?,?,?,?,?)`).bind(requestId, friend.id, staffId, payload, Date.now()).run();
+      const saved = await c.env.DB.prepare('SELECT * FROM manual_send_requests WHERE request_id = ?').bind(requestId)
+        .first<{ friend_id: string; staff_id: string; payload: string; sent: number; created_at: number }>();
+      if (!saved || saved.friend_id !== friend.id || saved.staff_id !== staffId || saved.payload !== payload) {
+        return c.json({ success: false, error: '送信IDが別の操作に使用されています' }, 409);
+      }
+      if (saved.sent) return c.json({ success: true, data: { sent: true, messageId: `manual:${requestId}` } });
+      // LINE retry keys expire at 24h. Never risk a second push after that window.
+      if (Date.now() - saved.created_at > 23 * 60 * 60 * 1000) {
+        return c.json({ success: false, error: '送信結果が未確定です。履歴を確認し、管理者に連絡してください' }, 409);
+      }
+    }
     let pushResponse: unknown = null;
-    if (messageType === 'text') {
+    if (requestId) {
+      const message = messageType === 'text'
+        ? { type: 'text' as const, text: body.content, ...(quoteToken ? { quoteToken } : {}) }
+        : messageType === 'image'
+          ? { type: 'image' as const, originalContentUrl: JSON.parse(body.content).originalContentUrl, previewImageUrl: JSON.parse(body.content).previewImageUrl }
+          : { type: 'flex' as const, altText: extractFlexAltText(JSON.parse(body.content)), contents: JSON.parse(body.content) };
+      pushResponse = await lineClient.pushMessage(friend.line_user_id, [message], requestId);
+    } else if (messageType === 'text') {
       pushResponse = await lineClient.pushTextMessage(
         friend.line_user_id,
         body.content,
@@ -713,15 +772,16 @@ chats.post('/api/chats/:id/send', async (c) => {
     const sentByStaffName = staff?.name ?? null;
 
     // メッセージログに記録
-    const logId = crypto.randomUUID();
+    const logId = requestId ? `manual:${requestId}` : crypto.randomUUID();
     await c.env.DB
-      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, source, quote_token, quoted_message_id, sent_by_staff_id, sent_by_staff_name, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?, ?, ?, ?, ?)`)
+      .prepare(`INSERT OR IGNORE INTO messages_log (id, friend_id, direction, message_type, content, source, quote_token, quoted_message_id, sent_by_staff_id, sent_by_staff_name, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'manual', ?, ?, ?, ?, ?)`)
       .bind(logId, friend.id, messageType, body.content, sentQuoteToken, quotedMessageId, sentByStaffId, sentByStaffName, jstNow())
       .run();
 
     // チャットの最終メッセージ日時を更新（chat.id を直接使う — friend_id で呼ばれても resolveOrCreateChat 済み）
     await updateChat(c.env.DB, chat.id, { status: 'in_progress', lastMessageAt: jstNow() });
 
+    if (requestId) await c.env.DB.prepare('UPDATE manual_send_requests SET sent = 1 WHERE request_id = ?').bind(requestId).run();
     return c.json({ success: true, data: { sent: true, messageId: logId } });
   } catch (err) {
     console.error('POST /api/chats/:id/send error:', err);

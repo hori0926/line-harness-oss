@@ -3,6 +3,9 @@ name: Worker CI
 on:
   pull_request:
     paths:
+      - 'scripts/deploy/**'
+      - 'scripts/dev/test-manual-runtime.mjs'
+      - 'apps/web/**'
       - 'apps/worker/**'
       - 'packages/db/**'
       - 'packages/shared/**'
@@ -13,6 +16,9 @@ on:
   push:
     branches: [main]
     paths:
+      - 'scripts/deploy/**'
+      - 'scripts/dev/test-manual-runtime.mjs'
+      - 'apps/web/**'
       - 'apps/worker/**'
       - 'packages/db/**'
       - 'packages/shared/**'
@@ -42,6 +48,9 @@ jobs:
       - run: pnpm --filter @line-crm/shared --filter @line-crm/line-sdk --filter @line-crm/db --filter @line-harness/update-engine build
       - run: pnpm --filter worker typecheck
       - run: pnpm --filter worker test
+      - run: pnpm --filter web test
+      - run: pnpm test:scripts
+      - run: node scripts/dev/test-manual-runtime.mjs
       - run: pnpm --filter worker build
         env:
           VITE_LIFF_ID: ${{ vars.VITE_LIFF_ID }}

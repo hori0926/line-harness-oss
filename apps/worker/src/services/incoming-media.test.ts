@@ -30,6 +30,11 @@ function makeR2Stub() {
       }
       return { key } as never;
     }),
+    createMultipartUpload: vi.fn(async () => ({
+      uploadPart: vi.fn(async (partNumber: number) => ({ partNumber, etag: `part-${partNumber}` })),
+      complete: vi.fn(async () => ({})),
+      abort: vi.fn(async () => {}),
+    })),
     delete: vi.fn(async (key: string) => {
       deleted.push(key);
     }),
@@ -217,7 +222,7 @@ describe('fetchAndStoreIncomingMedia — file', () => {
 });
 
 describe('fetchAndStoreIncomingMedia — メモリ安全性', () => {
-  test('arrayBuffer() を経由せず ReadableStream のまま R2 に渡す', async () => {
+  test('全体の arrayBuffer() を作らず固定長の小さいバッファで R2 に渡す', async () => {
     const { r2, puts } = makeR2Stub();
     const res = okResponse(new ArrayBuffer(2048), 'video/mp4');
     const arrayBufferSpy = vi.spyOn(res, 'arrayBuffer');
@@ -234,7 +239,8 @@ describe('fetchAndStoreIncomingMedia — メモリ安全性', () => {
       kind: 'video',
     });
 
-    expect(puts[0].value).toBeInstanceOf(ReadableStream);
+    expect(puts[0].value).toBeInstanceOf(Uint8Array);
+    expect((puts[0].value as Uint8Array).byteLength).toBe(2048);
     expect(arrayBufferSpy).not.toHaveBeenCalled();
     expect(textSpy).not.toHaveBeenCalled();
     expect(blobSpy).not.toHaveBeenCalled();

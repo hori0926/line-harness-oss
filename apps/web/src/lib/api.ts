@@ -35,6 +35,16 @@ import type {
 } from '@line-crm/shared'
 import { getApiBase } from './api-base'
 
+// Keep an uncertain send's retry key across page reloads. No message text is stored.
+async function manualSendRequestId(chatId: string, data: unknown): Promise<{ key: string; id: string }> {
+  const bytes = new TextEncoder().encode(JSON.stringify({ chatId, data }));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const key = 'lh-send:' + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+  const id = sessionStorage.getItem(key) ?? crypto.randomUUID();
+  sessionStorage.setItem(key, id);
+  return { key, id };
+}
+
 /** Per-account delivery-health snapshot for the dashboard cards. */
 export type AccountDeliveryHealth = {
   lineAccountId: string
@@ -990,6 +1000,8 @@ export const api = {
       ),
   },
   chats: {
+    activity: () => fetchApi<ApiResponse<{ version: string }>>('/api/chats/activity'),
+    lease: (id: string) => fetchApi<ApiResponse<{ owned: boolean; staffName: string; expiresAt: number }>>(`/api/chats/${id}/lease`, { method: 'POST' }),
     list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean; limit?: number; beforeAt?: string; beforeId?: string }) => {
       const query: Record<string, string> = {}
       if (params?.status) query.status = params.status
@@ -1043,11 +1055,14 @@ export const api = {
         body: JSON.stringify(data),
       }),
     // quotedMessageId は messageType: 'text' のときのみ指定可能 (画像に付けるとサーバーが 400)
-    send: (id: string, data: { content: string; messageType?: string; quotedMessageId?: string }) =>
-      fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
-        method: 'POST',
-        body: JSON.stringify(data),
-      }),
+    send: async (id: string, data: { content: string; messageType?: string; quotedMessageId?: string }) => {
+      const request = await manualSendRequestId(id, data)
+      const result = await fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
+        method: 'POST', body: JSON.stringify({ ...data, requestId: request.id }),
+      })
+      if (result.success) sessionStorage.removeItem(request.key)
+      return result
+    },
   },
   reminders: {
     list: (params?: { accountId?: string }) => {

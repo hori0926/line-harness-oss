@@ -1,3 +1,5 @@
+import { manualInboxQueue } from './services/manual-inbox.js';
+import type { ManualInboxJob } from './services/manual-inbox.js';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
@@ -91,6 +93,8 @@ import {
 export type Env = {
   Bindings: {
     DB: D1Database;
+    MANUAL_REPLY_ONLY?: string;
+    MANUAL_INBOX?: Queue<ManualInboxJob>;
     IMAGES: R2Bucket;
     ASSETS: Fetcher;
     LINE_CHANNEL_SECRET: string;
@@ -993,6 +997,7 @@ export { TenantScheduler };
 
 export default {
   fetch: app.fetch,
+  queue: manualInboxQueue,
   scheduled,
 };
 // redeploy trigger

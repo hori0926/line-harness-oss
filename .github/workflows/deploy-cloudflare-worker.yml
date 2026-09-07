@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'scripts/deploy/**'
       - 'apps/worker/**'
       - 'apps/liff/**'
       - 'packages/db/**'
@@ -12,6 +13,13 @@ on:
       - 'packages/line-sdk/**'
       - 'packages/update-engine/**'
       - '.github/workflows/deploy-cloudflare-worker.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: line-harness-worker-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -35,28 +43,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
-        run: |
-          test -n "$CLOUDFLARE_API_TOKEN"
-          test -n "$CLOUDFLARE_ACCOUNT_ID"
-          test -n "$D1_DATABASE_NAME"
-
-          npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --command \
-            "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
-
-          for f in $(ls packages/db/migrations/*.sql | sort); do
-            name=$(basename "$f")
-            applied=$(npx wrangler d1 execute "$D1_DATABASE_NAME" --remote \
-              --command "SELECT name FROM _migrations WHERE name = '${name}'" --json \
-              | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));console.log(d[0]?.results?.length||0)")
-            if [ "$applied" = "0" ]; then
-              echo "Applying: $name"
-              npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --file="$f"
-              npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --command \
-                "INSERT INTO _migrations (name, applied_at) VALUES ('${name}', datetime('now'))"
-            else
-              echo "Skipped: $name"
-            fi
-          done
+        run: node scripts/deploy/migrate-cloudflare.mjs --remote
 
       - name: Build Worker and LIFF assets
         run: pnpm --filter worker build
@@ -65,40 +52,18 @@ jobs:
           VITE_BOT_BASIC_ID: ${{ vars.VITE_BOT_BASIC_ID }}
           VITE_CALENDAR_CONNECTION_ID: ${{ vars.VITE_CALENDAR_CONNECTION_ID }}
 
-      - name: Patch wrangler config
+      - name: Configure manual operation
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           D1_DATABASE_NAME: ${{ secrets.D1_DATABASE_NAME }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
-          WORKER_NAME: ${{ vars.WORKER_NAME || 'your-worker-name' }}
-          # Admin CORS config — set these as repo Variables when the admin panel
-          # and the Worker API are on different origins (e.g. *.pages.dev admin
-          # + *.workers.dev API). Baking them into the deployed config (vars)
-          # means every deploy carries them, so they can't be silently dropped
-          # the way a manually-set dashboard variable is on redeploy.
+          WORKER_NAME: ${{ vars.WORKER_NAME }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          INBOX_QUEUE_NAME: ${{ vars.INBOX_QUEUE_NAME }}
+          INBOX_DLQ_NAME: ${{ vars.INBOX_DLQ_NAME }}
           ADMIN_ORIGIN: ${{ vars.ADMIN_ORIGIN }}
-          ADMIN_ALLOW_CROSS_SITE: ${{ vars.ADMIN_ALLOW_CROSS_SITE }}
           WORKER_URL: ${{ vars.WORKER_URL }}
-        run: |
-          test -n "$D1_DATABASE_ID"
-          cd apps/worker
-          sed -i \
-            -e "s|\"account_id\":\"[^\"]*\"|\"account_id\":\"${CLOUDFLARE_ACCOUNT_ID}\"|g" \
-            -e "s|\"database_name\":\"[^\"]*\"|\"database_name\":\"${D1_DATABASE_NAME}\"|g" \
-            -e "s|\"database_id\":\"[^\"]*\"|\"database_id\":\"${D1_DATABASE_ID}\"|g" \
-            dist/line_harness/wrangler.json
-          # Inject admin CORS vars into the deployed config when ADMIN_ORIGIN is
-          # set. ADMIN_ALLOW_CROSS_SITE defaults to "true" (SameSite=None; Secure
-          # cookies) since cross-origin admin/API is the case that needs it.
-          if [ -n "$ADMIN_ORIGIN" ]; then
-            tmp="$(mktemp)"
-            jq --arg o "$ADMIN_ORIGIN" --arg x "$ADMIN_ALLOW_CROSS_SITE" --arg w "$WORKER_URL" '
-              .vars.ADMIN_ORIGIN = $o
-              | .vars.ADMIN_ALLOW_CROSS_SITE = (if $x == "" then "true" else $x end)
-              | (if $w != "" then .vars.WORKER_URL = $w else . end)
-            ' dist/line_harness/wrangler.json > "$tmp" && mv "$tmp" dist/line_harness/wrangler.json
-            echo "Patched admin CORS vars: ADMIN_ORIGIN=$ADMIN_ORIGIN ADMIN_ALLOW_CROSS_SITE=${ADMIN_ALLOW_CROSS_SITE:-true}"
-          fi
+        run: node scripts/deploy/patch-cloudflare-config.mjs
 
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3

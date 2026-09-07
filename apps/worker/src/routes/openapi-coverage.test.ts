@@ -75,6 +75,9 @@ function documentedRoutes(): string[] {
  * 迷ったら KNOWN_GAPS に置く（負債として見えるほうが安全）。
  */
 const CLIENT_ONLY: readonly string[] = [
+  // Browser heartbeat for short-lived manual conversation ownership.
+  'POST /api/chats/{id}/lease',
+  'GET /api/chats/activity',
   // liff (29)
   'GET /api/liff/affiliate/me',
   'GET /api/liff/affiliate/offers',
